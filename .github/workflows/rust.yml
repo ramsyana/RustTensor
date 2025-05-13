@@ -1,0 +1,215 @@
+name: Rust CI/CD
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:  # Allow manual triggering
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"  # Treat warnings as errors
+  RUST_BACKTRACE: 1  # Enable backtraces for better error reporting
+
+jobs:
+  check:
+    name: Check and Lint
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install latest stable Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+        components: rustfmt, clippy
+    
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-check-
+          ${{ runner.os }}-cargo-
+    
+    - name: Check formatting
+      uses: actions-rs/cargo@v1
+      with:
+        command: fmt
+        args: -- --check
+    
+    - name: Run clippy
+      uses: actions-rs/cargo@v1
+      with:
+        command: clippy
+        args: --all-targets --all-features -- -D warnings
+
+  test-cpu:
+    name: Test CPU Backend
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: [stable, beta]  # Test on both stable and beta Rust
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Rust ${{ matrix.rust }}
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: ${{ matrix.rust }}
+        override: true
+    
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-test-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-test-${{ matrix.rust }}-
+          ${{ runner.os }}-cargo-test-
+          ${{ runner.os }}-cargo-
+    
+    - name: Build (CPU)
+      uses: actions-rs/cargo@v1
+      with:
+        command: build
+        args: --verbose
+    
+    - name: Run tests (CPU)
+      uses: actions-rs/cargo@v1
+      with:
+        command: test
+        args: --verbose
+    
+    - name: Generate coverage report
+      if: matrix.rust == 'stable'
+      uses: actions-rs/tarpaulin@v0.1
+      with:
+        version: '0.15.0'
+        args: '--ignore-tests'
+
+    - name: Upload coverage to Codecov
+      if: matrix.rust == 'stable'
+      uses: codecov/codecov-action@v3
+
+  test-cuda:
+    name: Test CUDA Backend
+    needs: test-cpu
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install latest stable Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+    
+    - name: Install CUDA
+      uses: Jimver/cuda-toolkit@v0.2.11
+      id: cuda-toolkit
+      with:
+        cuda: '11.8.0'
+        method: 'network'
+        sub-packages: '["nvcc", "cudart", "cublas", "cusolver", "thrust"]'
+    
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-cuda-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-cuda-
+          ${{ runner.os }}-cargo-
+    
+    - name: Build (CUDA)
+      uses: actions-rs/cargo@v1
+      with:
+        command: build
+        args: --features cuda --verbose
+      env:
+        CUDA_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
+        CUBLAS_LIB_DIR: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64
+        LD_LIBRARY_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64:$LD_LIBRARY_PATH
+    
+    - name: Run tests (CUDA)
+      uses: actions-rs/cargo@v1
+      with:
+        command: test
+        args: --features cuda --verbose
+      env:
+        CUDA_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}
+        CUBLAS_LIB_DIR: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64
+        LD_LIBRARY_PATH: ${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64:$LD_LIBRARY_PATH
+
+  docs:
+    name: Build and Deploy Docs
+    needs: [test-cpu, test-cuda]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install latest stable Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+    
+    - name: Build documentation
+      uses: actions-rs/cargo@v1
+      with:
+        command: doc
+        args: --features cuda --no-deps --verbose
+    
+    # Create index.html redirect
+    - name: Create index.html
+      run: |
+        echo '<meta http-equiv="refresh" content="0; url=rust_tensor_library">' > target/doc/index.html
+    
+    - name: Deploy to GitHub Pages
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./target/doc
+        force_orphan: true
+        user_name: 'github-actions[bot]'
+        user_email: 'github-actions[bot]@users.noreply.github.com'
+        commit_message: 'Deploy documentation for ${{ github.sha }}'
+
+  release:
+    name: Create Release
+    needs: [test-cpu, test-cuda, docs]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        generate_release_notes: true
+        prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}

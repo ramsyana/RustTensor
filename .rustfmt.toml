@@ -1,0 +1,9 @@
+# Rustfmt configuration
+edition = "2021"
+max_width = 100
+tab_spaces = 4
+newline_style = "Unix"
+use_small_heuristics = "Default"
+imports_granularity = "Crate"
+reorder_imports = true
+format_code_in_doc_comments = true 

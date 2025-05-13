@@ -1,0 +1,3283 @@
+#![cfg(feature = "cuda")] // Ensure this file is only compiled when cuda feature is enabled
+
+use super::context::get_global_context;
+use super::storage::CudaStorage;
+use crate::backend::cpu::CpuBackend; // Needed for random generation fallbacks
+use crate::backend::cuda::CudaContextGuard;
+use crate::backend::{Backend, Error}; // Import Backend trait and Error
+use crate::init;
+use crate::OpType; // Import OpType
+use cust::launch;
+use cust::memory::DeviceBuffer;
+use cust::memory::GpuBuffer;
+use std::fmt::Debug; // Import required traits for Storage // Import the re-exported CudaContextGuard
+use super::utils::{compute_reduction_shape, to_device_buffer_generic}; // Add this line
+
+#[cfg(feature = "debug_logs")]
+use std::println as debug_println;
+#[cfg(not(feature = "debug_logs"))]
+macro_rules! debug_println {
+    ($($arg:tt)*) => {};
+}
+
+/// Helper function to calculate strides for a given shape
+/// Strides represent the number of elements to skip to move by 1 in each dimension
+fn calc_strides(shape: &[usize]) -> Vec<usize> {
+    if shape.is_empty() {
+        return vec![]; // Return empty strides for 0D tensors (scalars)
+    }
+
+    let mut strides = vec![1; shape.len()];
+    for i in (0..shape.len() - 1).rev() {
+        strides[i] = strides[i + 1] * shape[i + 1];
+    }
+    strides
+}
+
+// --- CudaBackend Struct ---
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaBackend;
+
+// --- Helper Function (Remains outside the impl block) ---
+// Helper function to reverse broadcasting by summing along axes for CUDA
+fn cuda_unbroadcast(grad: CudaStorage, target_shape: &[usize]) -> Result<CudaStorage, Error> {
+    let mut current_grad = grad;
+    let initial_grad_shape = CudaBackend::shape(&current_grad).to_vec();
+
+    #[cfg(feature = "cuda")]
+    {
+        use std::println;
+        println!(
+            "[cuda_unbroadcast][CUDA] ENTER: initial grad_shape: {:?}, target_shape: {:?}",
+            initial_grad_shape, target_shape
+        );
+        if let Ok(data_vec) = CudaBackend::copy_to_host(&current_grad) {
+            println!(
+                "[cuda_unbroadcast][CUDA] ENTER: initial grad data sample: {:?} ... {:?}",
+                &data_vec[..data_vec.len().min(5)],
+                &data_vec[data_vec.len().saturating_sub(5)..]
+            );
+        }
+    }
+
+    let grad_shape = CudaBackend::shape(&current_grad);
+    if grad_shape == target_shape {
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!("[cuda_unbroadcast][CUDA] shapes match, returning early");
+        }
+        return Ok(current_grad);
+    }
+
+    let grad_ndim = grad_shape.len();
+    let target_ndim = target_shape.len();
+
+    // Special case: reducing to scalar (0-dimensional tensor)
+    if target_ndim == 0 {
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!("[cuda_unbroadcast][CUDA] Target is scalar (0D).");
+            if grad_ndim == 0 {
+                println!("[cuda_unbroadcast][CUDA] Input is already scalar, returning.");
+                return Ok(current_grad);
+            }
+        }
+        for axis in (0..grad_ndim).rev() {
+            #[cfg(feature = "cuda")]
+            {
+                use std::println;
+                println!("[cuda_unbroadcast][CUDA] Summing axis {} for scalar reduction. Shape before: {:?}", axis, CudaBackend::shape(&current_grad));
+            }
+            current_grad = CudaBackend::sum_along_axis(&current_grad, axis)?;
+            #[cfg(feature = "cuda")]
+            {
+                use std::println;
+                println!(
+                    "[cuda_unbroadcast][CUDA] Shape after sum axis {}: {:?}",
+                    axis,
+                    CudaBackend::shape(&current_grad)
+                );
+                if let Ok(data_vec) = CudaBackend::copy_to_host(&current_grad) {
+                    println!(
+                        "[cuda_unbroadcast][CUDA] Data after sum axis {}: {:?}",
+                        axis,
+                        &data_vec[..data_vec.len().min(5)]
+                    );
+                }
+            }
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[cuda_unbroadcast][CUDA] Finished scalar reduction. Final shape: {:?}",
+                CudaBackend::shape(&current_grad)
+            );
+        }
+        return Ok(current_grad);
+    }
+
+    // 1. Sum over leading dimensions if grad has more dims than target
+    if grad_ndim > target_ndim {
+        let axes_to_sum: Vec<usize> = (0..(grad_ndim - target_ndim)).collect();
+        for axis in axes_to_sum.iter().rev() {
+            #[cfg(feature = "cuda")]
+            {
+                use std::println;
+                println!(
+                    "[cuda_unbroadcast][CUDA] summing leading axis {} (before): {:?}",
+                    axis,
+                    CudaBackend::shape(&current_grad)
+                );
+            }
+            current_grad = CudaBackend::sum_along_axis(&current_grad, *axis)?;
+            #[cfg(feature = "cuda")]
+            {
+                use std::println;
+                println!(
+                    "[cuda_unbroadcast][CUDA] shape after sum: {:?}",
+                    CudaBackend::shape(&current_grad)
+                );
+            }
+        }
+    }
+
+    let current_shape = CudaBackend::shape(&current_grad);
+    let current_ndim = current_shape.len();
+
+    if current_ndim != target_ndim {
+        return Err(Error::InternalLogicError(format!(
+            "cuda_unbroadcast dimension mismatch after summing leading axes: current {:?}, target {:?}",
+            current_shape, target_shape
+        )));
+    }
+
+    let mut axes_to_sum_for_size_1 = Vec::new();
+    for i in 0..target_ndim {
+        if target_shape[i] == 1 && current_shape[i] != 1 {
+            axes_to_sum_for_size_1.push(i);
+        } else if target_shape[i] != current_shape[i] && current_shape[i] != 1 {
+            return Err(Error::IncompatibleShapes {
+                op: "cuda_unbroadcast (dim mismatch)".to_string(),
+                shape_a: current_shape.to_vec(),
+                shape_b: target_shape.to_vec(),
+            });
+        }
+    }
+    #[cfg(feature = "cuda")]
+    {
+        use std::println;
+        println!(
+            "[cuda_unbroadcast][CUDA] axes_to_sum_for_size_1: {:?}",
+            axes_to_sum_for_size_1
+        );
+    }
+
+    axes_to_sum_for_size_1.sort_by(|a, b| b.cmp(a));
+    for axis in axes_to_sum_for_size_1.iter() {
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[cuda_unbroadcast][CUDA] summing size-1 axis {} (before): {:?}",
+                axis,
+                CudaBackend::shape(&current_grad)
+            );
+        }
+        current_grad = CudaBackend::sum_along_axis(&current_grad, *axis)?;
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[cuda_unbroadcast][CUDA] shape after sum: {:?}",
+                CudaBackend::shape(&current_grad)
+            );
+        }
+    }
+
+    let final_shape = CudaBackend::shape(&current_grad).to_vec();
+    #[cfg(feature = "cuda")]
+    {
+        use std::println;
+        println!(
+            "[cuda_unbroadcast][CUDA] final_shape before check: {:?}",
+            final_shape
+        );
+    }
+    if final_shape.as_slice() == target_shape {
+        Ok(current_grad)
+    } else {
+        let non_one_final: Vec<usize> = final_shape.iter().filter(|&&d| d != 1).cloned().collect();
+        let non_one_target: Vec<usize> =
+            target_shape.iter().filter(|&&d| d != 1).cloned().collect();
+        if non_one_final == non_one_target
+            && CudaBackend::size(&current_grad) == target_shape.iter().product::<usize>().max(1)
+        {
+            current_grad.set_shape(target_shape.to_vec());
+            Ok(current_grad)
+        } else {
+            Err(Error::InternalLogicError(format!(
+                "cuda_unbroadcast: Final shape mismatch. Expected {:?}, got {:?}.",
+                target_shape, final_shape
+            )))
+        }
+    }
+}
+
+// --- Backend Implementation ---
+impl Backend for CudaBackend {
+    // Define the associated storage type
+    type Storage = CudaStorage; // Moved inside impl
+
+    // --- Optimizer Steps ---
+    fn momentum_sgd_step(
+        param: &mut Self::Storage,    // CudaStorage
+        grad: &Self::Storage,         // CudaStorage - Gradient Input
+        velocity: &mut Self::Storage, // CudaStorage - Velocity State (Mutable)
+        lr: f32,                      // Learning Rate
+        momentum: f32,                // Momentum Factor
+    ) -> Result<(), Error> {
+        // Shape checks
+        let param_shape = param.shape(); // Get expected shape once
+        if param_shape != velocity.shape() {
+            return Err(Error::ShapeMismatch {
+                expected: param_shape.to_vec(),
+                actual: velocity.shape().to_vec(),
+            });
+        }
+        if param_shape != grad.shape() {
+            return Err(Error::ShapeMismatch {
+                expected: param_shape.to_vec(),
+                actual: grad.shape().to_vec(),
+            });
+        }
+
+        let n = param.len(); // Use buffer length
+        if n == 0 {
+            return Ok(());
+        }
+
+        let ctx = get_global_context()?;
+        let kernel = ctx.get_kernel("momentum_sgd_step_kernel").ok_or_else(|| {
+            Error::CudaError(
+                "momentum_sgd_step_kernel not found. Check optimizer.cu and build.rs.".to_string(),
+            )
+        })?;
+        let stream = ctx.get_stream();
+        let block_size = 256u32;
+        let grid_size = n.div_ceil(block_size as usize) as u32;
+
+        unsafe {
+            launch!(kernel<<<grid_size, block_size, 0, stream>>>(
+                param.as_mut_ptr(),     // *mut float param
+                grad.as_ptr(),          // *const float grad
+                velocity.as_mut_ptr(),  // *mut float velocity
+                lr,
+                momentum,
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn adagrad_step(
+        param: &mut Self::Storage,
+        grad: &Self::Storage,
+        accum_sq_grad: &mut Self::Storage,
+        lr: f32,
+        epsilon: f32,
+    ) -> Result<(), Error> {
+        let param_shape = param.shape();
+        if param_shape != grad.shape() {
+            return Err(Error::ShapeMismatch {
+                expected: param_shape.to_vec(),
+                actual: grad.shape().to_vec(),
+            });
+        }
+        if param_shape != accum_sq_grad.shape() {
+            return Err(Error::ShapeMismatch {
+                expected: param_shape.to_vec(),
+                actual: accum_sq_grad.shape().to_vec(),
+            });
+        }
+        let n = param.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("adagrad_step_kernel")
+            .ok_or_else(|| Error::CudaError("adagrad_step_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+        let block_size = 256u32;
+        let grid_size = n.div_ceil(block_size as usize) as u32;
+        unsafe {
+            launch!(kernel<<<grid_size, block_size, 0, stream>>>(
+                param.as_mut_ptr(),
+                grad.as_ptr(),
+                accum_sq_grad.as_mut_ptr(),
+                lr,
+                epsilon,
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(())
+    }
+
+    // --- Factory Methods ---
+    fn zeros(shape: &[usize]) -> Result<Self::Storage, Error> {
+        CudaStorage::zeros(shape)
+    }
+
+    fn random_uniform(shape: &[usize], low: f32, high: f32) -> Result<Self::Storage, Error> {
+        // Generate on CPU and copy to GPU
+        let cpu_storage = CpuBackend::random_uniform(shape, low, high)?;
+        let host_data = CpuBackend::copy_to_host(&cpu_storage)?;
+        Self::from_vec(host_data, shape) // Use Self::from_vec
+    }
+
+    fn random_normal(shape: &[usize], mean: f32, std_dev: f32) -> Result<Self::Storage, Error> {
+        // Initial simple implementation: Generate on CPU and copy to GPU
+        // TODO: Consider implementing directly with cuRAND for better performance
+        let cpu_storage = CpuBackend::random_normal(shape, mean, std_dev)?;
+        let host_data = CpuBackend::copy_to_host(&cpu_storage)?;
+        Self::from_vec(host_data, shape) // Use Self::from_vec
+    }
+
+    fn bernoulli(shape: &[usize], p: f32) -> Result<Self::Storage, Error> {
+        // Initial simple implementation: Generate on CPU and copy to GPU
+        // TODO: Consider implementing directly with cuRAND for better performance
+        let cpu_storage = CpuBackend::bernoulli(shape, p)?;
+        let host_data = CpuBackend::copy_to_host(&cpu_storage)?;
+        Self::from_vec(host_data, shape) // Use Self::from_vec
+    }
+
+    fn ones(shape: &[usize]) -> Result<Self::Storage, Error> {
+        let size = shape.iter().product::<usize>();
+        let mut storage = CudaStorage::zeros(shape)?;
+        let ones = vec![1.0f32; size];
+        storage.copy_from_slice(&ones)?;
+        Ok(storage)
+    }
+
+    fn from_vec(data: Vec<f32>, shape: &[usize]) -> Result<Self::Storage, Error> {
+        let mut storage = CudaStorage::new(shape)?;
+        storage.copy_from_slice(&data)?;
+        Ok(storage)
+    }
+
+    fn kaiming_uniform(fan_in: usize, shape: &[usize]) -> Result<Self::Storage, Error> {
+        let cpu_array = init::kaiming_uniform(fan_in, shape)?;
+        let data_vec = cpu_array.into_raw_vec();
+        Self::from_vec(data_vec, shape) // Use Self::from_vec
+    }
+
+    // --- Shape/Data Access ---
+    fn shape(storage: &Self::Storage) -> &[usize] {
+        storage.shape()
+    }
+
+    fn size(storage: &Self::Storage) -> usize {
+        // Return logical size based on shape, treat 0D scalar as size 1
+        if storage.shape().is_empty() {
+            1
+        } else {
+            storage.shape().iter().product()
+        }
+    }
+
+    fn into_raw_vec(storage: Self::Storage) -> Result<Vec<f32>, Error> {
+        storage.to_vec()
+    }
+
+    fn set_data(storage: &mut Self::Storage, data: Self::Storage) -> Result<(), Error> {
+        // Copy data from source to target
+        let ctx = get_global_context()?;
+        let stream = ctx.get_stream(); // Keep the stream for synchronization
+
+        // Use the helper method on CudaStorage
+        storage.copy_from_storage(&data)?;
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn set_shape(storage: &mut Self::Storage, shape: &[usize]) -> Result<(), Error> {
+        // Check that the total number of elements is the same
+        let old_size = storage.len();
+        let new_size = shape.iter().product::<usize>();
+        if old_size != new_size {
+            return Err(Error::IncompatibleShapes {
+                op: "set_shape".to_string(),
+                shape_a: storage.shape().to_vec(),
+                shape_b: shape.to_vec(),
+            });
+        }
+        storage.set_shape(shape.to_vec());
+        Ok(())
+    }
+
+    // --- Core Mathematical Operations ---
+    fn matmul(a: &Self::Storage, b: &Self::Storage) -> Result<Self::Storage, Error> {
+        let shape_a = a.shape();
+        let shape_b = b.shape();
+
+        // --- Basic Shape Checks ---
+        if shape_a.len() != 2 || shape_b.len() != 2 {
+            return Err(Error::InvalidOperation(
+                "CUDA matmul currently supports only 2D tensors".to_string(),
+            ));
+        }
+        let m = shape_a[0]; // Rows of A (and C)
+        let k = shape_a[1]; // Cols of A / Rows of B
+        let n = shape_b[1]; // Cols of B (and C)
+
+        if k != shape_b[0] {
+            return Err(Error::IncompatibleShapes {
+                op: "matmul".to_string(),
+                shape_a: shape_a.to_vec(),
+                shape_b: shape_b.to_vec(),
+            });
+        }
+
+        // --- Result Allocation ---
+        // C will have shape [m, n]
+        let mut output = CudaStorage::new(&[m, n])?;
+        if m == 0 || k == 0 || n == 0 {
+            return Ok(output); // Handle empty matrix case
+        }
+
+        // --- cuBLAS Setup ---
+        let ctx = get_global_context()?;
+        let handle = ctx.get_cublas_handle();
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+
+        // --- The Standard Trick for Row-Major C = A @ B ---
+        // Compute C_cm = B_cm @ A_cm using cublasSgemm, where _cm indicates
+        // column-major interpretation of the memory layout.
+        // The result stored in output.ptr will have the memory layout of C_cm,
+        // which is IDENTICAL to the desired row-major C_rm layout.
+        //
+        // cuBLAS signature: cublasSgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
+        //
+        // Mapping:
+        // transa: Operation on Matrix A for cuBLAS = B_cm => CUBLAS_OP_N
+        // transb: Operation on Matrix B for cuBLAS = A_cm => CUBLAS_OP_N
+        // m:      Rows of C_cm = n (original cols of B/C)
+        // n:      Cols of C_cm = m (original rows of A/C)
+        // k:      Inner dimension = k (original inner dimension)
+        // A:      Pointer to B_cm = b.ptr
+        // lda:    Leading dimension of B_cm [n, k] = n
+        // B:      Pointer to A_cm = a.ptr
+        // ldb:    Leading dimension of A_cm [k, m] = k
+        // C:      Pointer to C_cm = output.ptr
+        // ldc:    Leading dimension of C_cm [n, m] = n
+
+        let status = unsafe {
+            cublas_sys::cublasSgemm_v2(
+                handle,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N, // B is treated as column-major B_cm [n, k]
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N, // A is treated as column-major A_cm [k, m]
+                n as i32,                                   // rows of C_cm
+                m as i32,                                   // cols of C_cm
+                k as i32,                                   // inner dimension
+                &alpha,
+                b.as_ptr().as_raw() as *const f32, // Pointer to B's data (B_cm)
+                n as i32,                          // lda = rows of B_cm = n
+                a.as_ptr().as_raw() as *const f32, // Pointer to A's data (A_cm)
+                k as i32,                          // ldb = rows of A_cm = k
+                &beta,
+                output.as_mut_ptr().as_raw() as *mut f32, // Pointer to C's data (C_cm)
+                n as i32,                                 // ldc = rows of C_cm = n
+            )
+        };
+
+        // --- Check Status & Synchronize ---
+        if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            // Provide more context in the error message
+            return Err(Error::CublasError(format!(
+                "cuBLAS Sgemm (row-major trick) failed with status: {:?}. Dims: m={}, k={}, n={}",
+                status, m, k, n
+            )));
+        }
+
+        ctx.get_stream()
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+
+        // Output buffer now contains the correct C = A @ B result in row-major layout.
+        Ok(output)
+    }
+
+    fn mul(a: &Self::Storage, b: &Self::Storage) -> Result<Self::Storage, Error> {
+        // Determine broadcasted shape
+        let shape_a = a.shape();
+        let shape_b = b.shape();
+        let broadcast_shape = crate::util::broadcast_shapes(shape_a, shape_b)?;
+
+        // Broadcast inputs if necessary
+        let a_broadcasted = if shape_a != broadcast_shape.as_slice() {
+            Self::broadcast_to(a, &broadcast_shape)? // Use Self::broadcast_to
+        } else {
+            a.clone()
+        };
+        let b_broadcasted = if shape_b != broadcast_shape.as_slice() {
+            Self::broadcast_to(b, &broadcast_shape)? // Use Self::broadcast_to
+        } else {
+            b.clone()
+        };
+
+        let n = a_broadcasted.len();
+        if n == 0 {
+            return CudaStorage::new(&broadcast_shape);
+        }
+        let mut output = CudaStorage::new(&broadcast_shape)?;
+
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("mul_kernel")
+            .ok_or_else(|| Error::CudaError("mul_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+        let block_size = 256u32;
+        let grid_size = n.div_ceil(block_size as usize) as u32;
+
+        unsafe {
+            launch!(kernel<<<grid_size, block_size, 0, stream>>>(
+                a_broadcasted.as_ptr(), // Use broadcasted input
+                b_broadcasted.as_ptr(), // Use broadcasted input
+                output.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(output)
+    }
+
+    fn add(a: &Self::Storage, b: &Self::Storage) -> Result<Self::Storage, Error> {
+        // Determine broadcasted shape
+        let shape_a = a.shape();
+        let shape_b = b.shape();
+        let broadcast_shape = crate::util::broadcast_shapes(shape_a, shape_b)?;
+
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[CudaBackend::add][CUDA] shape_a: {:?}, shape_b: {:?}, broadcast_shape: {:?}",
+                shape_a, shape_b, broadcast_shape
+            );
+            if let Ok(vec_a) = Self::copy_to_host(a) {
+                println!(
+                    "[CudaBackend::add][CUDA] a sample: {:?} ... {:?}",
+                    &vec_a[..vec_a.len().min(3)],
+                    &vec_a[vec_a.len().saturating_sub(3)..]
+                );
+            }
+            if let Ok(vec_b) = Self::copy_to_host(b) {
+                println!(
+                    "[CudaBackend::add][CUDA] b sample: {:?} ... {:?}",
+                    &vec_b[..vec_b.len().min(3)],
+                    &vec_b[vec_b.len().saturating_sub(3)..]
+                );
+            }
+        }
+
+        // Broadcast inputs if necessary
+        let a_broadcasted = if shape_a != broadcast_shape.as_slice() {
+            Self::broadcast_to(a, &broadcast_shape)? // Use Self::broadcast_to
+        } else {
+            a.clone()
+        };
+        let b_broadcasted = if shape_b != broadcast_shape.as_slice() {
+            Self::broadcast_to(b, &broadcast_shape)? // Use Self::broadcast_to
+        } else {
+            b.clone()
+        };
+
+        let n = a_broadcasted.len();
+        if n == 0 {
+            return CudaStorage::new(&broadcast_shape);
+        }
+        let mut output = CudaStorage::new(&broadcast_shape)?;
+
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("add_kernel")
+            .ok_or_else(|| Error::CudaError("add_kernel not found".to_string()))?;
+
+        let stream = ctx.get_stream();
+        let block_size = 256;
+        let grid_size = n.div_ceil(block_size);
+
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                a_broadcasted.as_ptr(), // Use broadcasted input
+                b_broadcasted.as_ptr(), // Use broadcasted input
+                output.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            if let Ok(vec_out) = Self::copy_to_host(&output) {
+                println!(
+                    "[CudaBackend::add][CUDA] output sample: {:?} ... {:?}",
+                    &vec_out[..vec_out.len().min(3)],
+                    &vec_out[vec_out.len().saturating_sub(3)..]
+                );
+            }
+        }
+        Ok(output)
+    }
+
+    fn sub(a: &Self::Storage, b: &Self::Storage) -> Result<Self::Storage, Error> {
+        let shape_a = a.shape();
+        let shape_b = b.shape();
+        let broadcast_shape = crate::util::broadcast_shapes(shape_a, shape_b)?;
+        let a_broadcasted = if shape_a != broadcast_shape.as_slice() {
+            Self::broadcast_to(a, &broadcast_shape)?
+        } else {
+            a.clone()
+        };
+        let b_broadcasted = if shape_b != broadcast_shape.as_slice() {
+            Self::broadcast_to(b, &broadcast_shape)?
+        } else {
+            b.clone()
+        };
+        let n = a_broadcasted.len();
+        if n == 0 {
+            return CudaStorage::new(&broadcast_shape);
+        }
+        let mut output = CudaStorage::new(&broadcast_shape)?;
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("sub_kernel")
+            .ok_or_else(|| Error::CudaError("sub_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+        let block_size = 256u32;
+        let grid_size = n.div_ceil(block_size as usize) as u32;
+        unsafe {
+            launch!(kernel<<<grid_size, block_size, 0, stream>>>(
+                a_broadcasted.as_ptr(),
+                b_broadcasted.as_ptr(),
+                output.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(output)
+    }
+
+    fn div(a: &Self::Storage, b: &Self::Storage) -> Result<Self::Storage, Error> {
+        let shape_a = a.shape();
+        let shape_b = b.shape();
+        let broadcast_shape = crate::util::broadcast_shapes(shape_a, shape_b)?;
+        let a_broadcasted = if shape_a != broadcast_shape.as_slice() {
+            Self::broadcast_to(a, &broadcast_shape)?
+        } else {
+            a.clone()
+        };
+        let b_broadcasted = if shape_b != broadcast_shape.as_slice() {
+            Self::broadcast_to(b, &broadcast_shape)?
+        } else {
+            b.clone()
+        };
+        let n = a_broadcasted.len();
+        if n == 0 {
+            return CudaStorage::new(&broadcast_shape);
+        }
+        let mut output = CudaStorage::new(&broadcast_shape)?;
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("div_kernel")
+            .ok_or_else(|| Error::CudaError("div_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+        let block_size = 256u32;
+        let grid_size = n.div_ceil(block_size as usize) as u32;
+        unsafe {
+            launch!(kernel<<<grid_size, block_size, 0, stream>>>(
+                a_broadcasted.as_ptr(),
+                b_broadcasted.as_ptr(),
+                output.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(output)
+    }
+
+    fn div_scalar(x: &Self::Storage, scalar: f32) -> Result<Self::Storage, Error> {
+        if scalar == 0.0 {
+            return Err(Error::InvalidOperation(
+                "Division by zero scalar".to_string(),
+            ));
+        }
+        let n = x.len();
+        if n == 0 {
+            return CudaStorage::new(x.shape());
+        }
+        let mut output = CudaStorage::new(x.shape())?;
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("div_scalar_kernel")
+            .ok_or_else(|| Error::CudaError("div_scalar_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+        let block_size = 256u32;
+        let grid_size = n.div_ceil(block_size as usize) as u32;
+        unsafe {
+            launch!(kernel<<<grid_size, block_size, 0, stream>>>(
+                x.as_ptr(),
+                scalar,
+                output.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(output)
+    }
+
+    // --- GPU-Specific Data Movement Methods ---
+    fn copy_to_host(storage: &Self::Storage) -> Result<Vec<f32>, Error> {
+        storage.to_vec()
+    }
+
+    fn update_from_host(storage: &mut Self::Storage, data: &[f32]) -> Result<(), Error> {
+        storage.copy_from_slice(data)
+    }
+
+    fn sgd_step(w: &mut Self::Storage, dw: &Self::Storage, lr: f32) -> Result<(), Error> {
+        let n = Self::size(w);
+        if n == 0 {
+            return Ok(());
+        }
+
+        let ctx = get_global_context()?;
+        let kernel = ctx.get_kernel("sgd_step_kernel").ok_or_else(|| {
+            Error::CudaError(
+                "sgd_step_kernel not found. Check optimizer.cu and build.rs.".to_string(),
+            )
+        })?;
+        let stream = ctx.get_stream();
+        let block_size = 256;
+        let grid_size = n.div_ceil(block_size);
+
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                w.as_mut_ptr(),
+                dw.as_ptr(),
+                lr,
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn adam_step(
+        param: &mut Self::Storage,
+        grad: &Self::Storage,
+        m: &mut Self::Storage,
+        v: &mut Self::Storage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+        t: usize,
+    ) -> Result<(), Error> {
+        let param_shape = param.shape();
+        if param_shape != grad.shape() {
+            return Err(Error::ShapeMismatch {
+                expected: param_shape.to_vec(),
+                actual: grad.shape().to_vec(),
+            });
+        }
+        if param_shape != m.shape() {
+            return Err(Error::ShapeMismatch {
+                expected: param_shape.to_vec(),
+                actual: m.shape().to_vec(),
+            });
+        }
+        if param_shape != v.shape() {
+            return Err(Error::ShapeMismatch {
+                expected: param_shape.to_vec(),
+                actual: v.shape().to_vec(),
+            });
+        }
+        if t == 0 {
+            return Err(Error::InternalLogicError(
+                "Adam step called with t=0".to_string(),
+            ));
+        }
+        let n = param.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("adam_step_kernel")
+            .ok_or_else(|| Error::CudaError("adam_step_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+        let block_size = 256u32;
+        let grid_size = n.div_ceil(block_size as usize) as u32;
+        unsafe {
+            launch!(kernel<<<grid_size, block_size, 0, stream>>>(
+                param.as_mut_ptr(),
+                grad.as_ptr(),
+                m.as_mut_ptr(),
+                v.as_mut_ptr(),
+                lr,
+                beta1,
+                beta2,
+                epsilon,
+                t as i32,
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn transpose(x: &Self::Storage) -> Result<Self::Storage, Error> {
+        // Only 2D supported
+        let shape = x.shape();
+        if shape.len() != 2 {
+            return Err(Error::InvalidOperation(
+                "CUDA transpose currently supports only 2D tensors".to_string(),
+            ));
+        }
+        let rows = shape[0];
+        let cols = shape[1];
+        let new_shape = &[cols, rows];
+
+        // Allocate output buffer and handle empty tensor
+        let mut output = CudaStorage::new(new_shape)?;
+        if Self::size(x) == 0 {
+            return Ok(output);
+        }
+
+        // Launch custom transpose kernel
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("transpose_2d_kernel")
+            .ok_or_else(|| Error::CudaError("transpose_2d_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+
+        // Configure grid and block dimensions
+        let block_dim_x = 16u32;
+        let block_dim_y = 16u32;
+        let grid_dim_x = (rows as u32).div_ceil(block_dim_x);
+        let grid_dim_y = (cols as u32).div_ceil(block_dim_y);
+
+        unsafe {
+            launch!(kernel<<<(grid_dim_x, grid_dim_y, 1), (block_dim_x, block_dim_y, 1), 0, stream>>> (
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                rows as i32,
+                cols as i32,
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(output)
+    }
+
+    fn broadcast_to(x: &Self::Storage, shape: &[usize]) -> Result<Self::Storage, Error> {
+        let input_shape = x.shape();
+        let output_shape = shape;
+        if input_shape.len() > output_shape.len() {
+            return Err(Error::InvalidOperation(format!(
+                "Cannot broadcast from {:?} to shorter shape {:?}",
+                input_shape, output_shape
+            )));
+        }
+        let n_output = output_shape.iter().product::<usize>();
+        let n_input = Self::size(x);
+        if n_output == 0 {
+            return CudaStorage::zeros(output_shape);
+        }
+        if n_input == 0 && n_output > 0 {
+            return Err(Error::InvalidOperation(
+                "Cannot broadcast an empty tensor to a non-empty shape".to_string(),
+            ));
+        }
+
+        let mut output = CudaStorage::new(output_shape)?;
+        let input_ndim = input_shape.len();
+        let output_ndim = output_shape.len();
+
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[CudaBackend::broadcast_to][CUDA] Input shape: {:?}, Output shape: {:?}",
+                input_shape, output_shape
+            );
+            println!(
+                "[CudaBackend::broadcast_to][CUDA] n_input: {}, n_output: {}",
+                n_input, n_output
+            );
+        }
+
+        // Special case: scalar input (ndim = 0 or size = 1)
+        let mut padded_input_shape = vec![1; output_ndim];
+        let mut padded_input_strides = vec![0; output_ndim];
+
+        if n_input == 1 {
+            // For scalar input, all strides are 0 since we always read from index 0
+            #[cfg(feature = "cuda")]
+            {
+                println!("[CudaBackend::broadcast_to][CUDA] Scalar input detected, setting all strides to 0");
+            }
+        } else {
+            let offset = output_ndim - input_ndim;
+            let mut current_stride = 1;
+            for i in (0..input_ndim).rev() {
+                let dim = input_shape[i];
+                padded_input_shape[i + offset] = dim;
+                if dim == 1 {
+                    padded_input_strides[i + offset] = 0;
+                } else {
+                    padded_input_strides[i + offset] = current_stride;
+                    current_stride *= dim;
+                }
+            }
+        }
+
+        let mut output_strides = vec![0; output_ndim];
+        if output_ndim > 0 {
+            output_strides[output_ndim - 1] = 1;
+            for i in (0..output_ndim - 1).rev() {
+                output_strides[i] = output_strides[i + 1] * output_shape[i + 1];
+            }
+        }
+
+        // Convert shapes and strides to device-compatible arrays
+        let input_shape_vec: Vec<i32> = padded_input_shape.iter().map(|&d| d as i32).collect();
+        let output_shape_vec: Vec<i32> = output_shape.iter().map(|&d| d as i32).collect();
+        let input_strides_vec: Vec<i32> = padded_input_strides.iter().map(|&d| d as i32).collect();
+        let output_strides_vec: Vec<i32> = output_strides.iter().map(|&d| d as i32).collect();
+        let ctx = get_global_context()?;
+
+        let input_shape_buffer = DeviceBuffer::from_slice(&input_shape_vec)?;
+        let output_shape_buffer = DeviceBuffer::from_slice(&output_shape_vec)?;
+        let input_strides_buffer = DeviceBuffer::from_slice(&input_strides_vec)?;
+        let output_strides_buffer = DeviceBuffer::from_slice(&output_strides_vec)?;
+
+        let kernel = ctx
+            .get_kernel("broadcast_kernel")
+            .ok_or_else(|| Error::CudaError("broadcast_kernel not found".to_string()))?;
+
+        let stream = ctx.get_stream();
+        let block_size = 256u32;
+        let grid_size = n_output.div_ceil(block_size as usize) as u32;
+        unsafe {
+            launch!(kernel<<<grid_size, block_size, 0, stream>>>(
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                input_shape_buffer.as_device_ptr(),
+                output_shape_buffer.as_device_ptr(),
+                input_strides_buffer.as_device_ptr(),
+                output_strides_buffer.as_device_ptr(),
+                output_ndim as i32,
+                output_ndim as i32,
+                n_output as i32,
+                n_input as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(output)
+    }
+
+    fn exp(x: &Self::Storage) -> Result<Self::Storage, Error> {
+        let n = Self::size(x);
+        if n == 0 {
+            return CudaStorage::new(x.shape());
+        }
+        let mut output = CudaStorage::new(x.shape())?;
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("exp_kernel")
+            .ok_or_else(|| Error::CudaError("exp_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+        let block_size = 256u32;
+        let grid_size = n.div_ceil(block_size as usize) as u32;
+        unsafe {
+            launch!(kernel<<<grid_size, block_size, 0, stream>>>(
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(output)
+    }
+
+    fn ln(x: &Self::Storage) -> Result<Self::Storage, Error> {
+        let n = Self::size(x);
+        if n == 0 {
+            return CudaStorage::new(x.shape());
+        }
+        let mut output = CudaStorage::new(x.shape())?;
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("ln_kernel")
+            .ok_or_else(|| Error::CudaError("ln_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+        let block_size = 256u32;
+        let grid_size = n.div_ceil(block_size as usize) as u32;
+        unsafe {
+            launch!(kernel<<<grid_size, block_size, 0, stream>>>(
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(output)
+    }
+
+    fn map<F>(x: &Self::Storage, f: F) -> Result<Self::Storage, Error>
+    where
+        F: Fn(f32) -> f32 + Send + Sync + 'static,
+    {
+        // Copy the data to host
+        let host_data = Self::copy_to_host(x)?;
+
+        // Apply the function
+        let host_result: Vec<f32> = host_data.into_iter().map(f).collect();
+
+        // Copy back to device
+        let mut result = Self::zeros(Self::shape(x))?;
+        result.copy_from_slice(&host_result)?;
+
+        Ok(result)
+    }
+
+    // --- Reduction Operations ---
+    fn sum_along_axis(x: &Self::Storage, axis: usize) -> Result<Self::Storage, Error> {
+        debug_println!("--- sum_along_axis START (Axis={}) ---", axis);
+        let input_shape = x.shape();
+        let input_ndim = input_shape.len();
+
+        if axis >= input_ndim && input_ndim > 0 {
+            return Err(Error::InvalidOperation(format!(
+                "Axis {} out of bounds for tensor with {} dimensions",
+                axis, input_ndim
+            )));
+        }
+
+        if input_ndim == 0 {
+            if axis == 0 {
+                return Ok(x.clone());
+            } else {
+                return Err(Error::InvalidOperation(format!(
+                    "Axis {} invalid for 0D tensor",
+                    axis
+                )));
+            }
+        }
+
+        let mut output_shape = Vec::with_capacity(input_ndim.saturating_sub(1));
+        for (i, &dim) in input_shape.iter().enumerate() {
+            if i != axis {
+                output_shape.push(dim);
+            }
+        }
+        let output_ndim = output_shape.len();
+        let is_scalar_output = output_ndim == 0;
+        let output_size = if is_scalar_output {
+            1
+        } else {
+            output_shape.iter().product::<usize>()
+        };
+
+        if output_size == 0 {
+            return CudaStorage::zeros(&output_shape);
+        }
+
+        let mut output = CudaStorage::zeros(&output_shape)?;
+
+        let mut input_strides = vec![0i32; input_ndim];
+        if input_ndim > 0 {
+            input_strides[input_ndim - 1] = 1;
+            for i in (0..input_ndim - 1).rev() {
+                input_strides[i] = input_strides[i + 1] * (input_shape[i + 1] as i32);
+            }
+        }
+
+        let mut output_strides = vec![0i32; output_ndim];
+        if output_ndim > 0 {
+            output_strides[output_ndim - 1] = 1;
+            for i in (0..output_ndim - 1).rev() {
+                output_strides[i] = output_strides[i + 1] * (output_shape[i + 1] as i32);
+            }
+        }
+
+        // Convert shapes and strides to device-compatible arrays
+        let input_shape_vec: Vec<i32> = input_shape.iter().map(|&d| d as i32).collect();
+        let output_shape_vec: Vec<i32> = output_shape.iter().map(|&d| d as i32).collect();
+        let input_strides_vec: Vec<i32> = input_strides.clone();
+        let output_strides_vec: Vec<i32> = output_strides.clone();
+        let ctx = get_global_context()?;
+
+        let input_shape_buffer = DeviceBuffer::from_slice(&input_shape_vec)?;
+        let output_shape_buffer = DeviceBuffer::from_slice(&output_shape_vec)?;
+        let input_strides_buffer = DeviceBuffer::from_slice(&input_strides_vec)?;
+        let output_strides_buffer = DeviceBuffer::from_slice(&output_strides_vec)?;
+
+        let kernel = ctx
+            .get_kernel("sum_along_axis_kernel")
+            .ok_or_else(|| Error::CudaError("sum_along_axis_kernel not found".to_string()))?;
+
+        let stream = ctx.get_stream();
+        let block_size = 256u32;
+        let grid_size = output_size.div_ceil(block_size as usize) as u32;
+        let n_input = Self::size(x); // Get total input elements
+
+        debug_println!("[DEBUG] sum_along_axis: launching kernel...");
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[CudaBackend::sum_along_axis][CUDA] axis: {}, input_shape: {:?}",
+                axis, input_shape
+            );
+            println!(
+                "[CudaBackend::sum_along_axis][CUDA] output_shape: {:?}",
+                output_shape
+            );
+        }
+        unsafe {
+            launch!(kernel<<<grid_size, block_size, 0, stream>>>(
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                input_shape_buffer.as_device_ptr(),
+                input_strides_buffer.as_device_ptr(),
+                output_shape_buffer.as_device_ptr(),
+                output_strides_buffer.as_device_ptr(),
+                input_ndim as i32,
+                output_ndim as i32,
+                axis as i32,
+                output_size as i32,
+                n_input as i32  // Added n_input parameter
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+
+        if is_scalar_output {
+            output.set_shape(vec![]);
+        }
+
+        debug_println!("--- sum_along_axis END ---");
+        Ok(output)
+    }
+
+    fn sum_all(x: &Self::Storage) -> Result<f32, Error> {
+        if Self::size(x) == 0 {
+            // Use Self::size
+            return Ok(0.0f32);
+        }
+
+        let mut current_sum = x.clone(); // Start with a clone
+        let initial_ndim = Self::shape(&current_sum).len(); // Use Self::shape
+
+        // Sum along axes from last to first
+        for axis in (0..initial_ndim).rev() {
+            current_sum = Self::sum_along_axis(&current_sum, axis)?; // Use Self::sum_along_axis
+        }
+
+        // Result should be a scalar tensor (shape [])
+        if !Self::shape(&current_sum).is_empty() {
+            // Use Self::shape
+            return Err(Error::InternalLogicError(format!(
+                "sum_all did not result in a scalar tensor. Final shape: {:?}",
+                Self::shape(&current_sum) // Use Self::shape
+            )));
+        }
+
+        // Copy the single scalar value to host
+        let host_vec = Self::copy_to_host(&current_sum)?; // Use Self::copy_to_host
+        if host_vec.len() != 1 {
+            return Err(Error::InternalLogicError(
+                "Scalar tensor for sum_all has != 1 element".to_string(),
+            ));
+        }
+        Ok(host_vec[0])
+    }
+
+    fn max_along_axis(x: &Self::Storage, axis: usize) -> Result<Self::Storage, Error> {
+        let input_shape = x.shape();
+        let input_ndim = input_shape.len();
+
+        if axis >= input_ndim {
+            return Err(Error::InvalidOperation(format!(
+                "Axis {} out of bounds for tensor with {} dimensions",
+                axis, input_ndim
+            )));
+        }
+
+        // Handle scalar case
+        if input_ndim == 0 {
+            return Ok(x.clone());
+        }
+
+        // Compute output shape by removing the specified axis
+        let mut output_shape = Vec::with_capacity(input_ndim.saturating_sub(1));
+        for (i, &dim) in input_shape.iter().enumerate() {
+            if i != axis {
+                output_shape.push(dim);
+            }
+        }
+
+        // Special case: if output is 0-dimensional (scalar), we need to handle it specially
+        let is_scalar_output = output_shape.is_empty();
+        let output_size = if is_scalar_output {
+            1
+        } else {
+            output_shape.iter().product::<usize>()
+        };
+
+        // Create output storage
+        let mut output = CudaStorage::zeros(&output_shape)?;
+
+        let mut input_strides = vec![0i32; input_ndim];
+        if input_ndim > 0 {
+            input_strides[input_ndim - 1] = 1;
+            for i in (0..input_ndim - 1).rev() {
+                input_strides[i] = input_strides[i + 1] * (input_shape[i + 1] as i32);
+            }
+        }
+
+        let mut output_strides = vec![0i32; output_shape.len()];
+        if !output_shape.is_empty() {
+            output_strides[output_shape.len() - 1] = 1;
+            for i in (0..output_shape.len() - 1).rev() {
+                output_strides[i] = output_strides[i + 1] * (output_shape[i + 1] as i32);
+            }
+        }
+
+        // Convert shapes and strides to device-compatible arrays
+        let input_shape_vec: Vec<i32> = input_shape.iter().map(|&d| d as i32).collect();
+        let output_shape_vec: Vec<i32> = output_shape.iter().map(|&d| d as i32).collect();
+        let input_strides_vec: Vec<i32> = input_strides.to_vec();
+        let output_strides_vec: Vec<i32> = output_strides.to_vec();
+
+        let ctx = get_global_context()?;
+
+        // Create device buffers for shape and stride information
+        let input_shape_buffer = DeviceBuffer::from_slice(&input_shape_vec)
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        let output_shape_buffer = DeviceBuffer::from_slice(&output_shape_vec)
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        let input_strides_buffer = DeviceBuffer::from_slice(&input_strides_vec)
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        let output_strides_buffer = DeviceBuffer::from_slice(&output_strides_vec)
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+
+        let kernel = ctx
+            .get_kernel("max_along_axis_kernel")
+            .ok_or_else(|| Error::CudaError("max_along_axis_kernel not found".to_string()))?;
+
+        let stream = ctx.get_stream();
+        let block_size = 256;
+        let grid_size = output_size.div_ceil(block_size);
+        let n_input = Self::size(x); // Get total input elements
+
+        debug_println!("[DEBUG] max_along_axis: launching kernel...");
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                input_shape_buffer.as_device_ptr(),
+                input_strides_buffer.as_device_ptr(),
+                output_shape_buffer.as_device_ptr(),
+                output_strides_buffer.as_device_ptr(),
+                input_shape.len() as i32,
+                if is_scalar_output { 0 } else { output_shape.len() as i32 },
+                axis as i32,
+                output_size as i32,
+                n_input as i32  // Added n_input parameter
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+
+        // Special case: if output is 0-dimensional (scalar), adjust shape
+        if is_scalar_output {
+            output.set_shape(vec![]);
+        }
+
+        Ok(output)
+    }
+
+    fn mean(x: &Self::Storage, axis: Option<usize>) -> Result<Self::Storage, Error> {
+        match axis {
+            None => {
+                debug_println!("--- mean (Global) START ---");
+                let input_shape = x.shape();
+                let _input_ndim = input_shape.len();
+                let size = Self::size(x) as f32; // Use Self::size
+
+                if size == 0.0 {
+                    debug_println!("Global mean on empty tensor, returning scalar zero");
+                    return Self::from_vec(vec![0.0], &[]); // Use Self::from_vec
+                }
+
+                debug_println!("Calculating global sum for mean...");
+                let mut current_sum = x.clone(); // Start with a clone
+                let initial_ndim = Self::shape(&current_sum).len(); // Use Self::shape
+
+                // Sum along axes from last to first
+                for axis in (0..initial_ndim).rev() {
+                    current_sum = Self::sum_along_axis(&current_sum, axis)?; // Use Self::sum_along_axis
+                }
+
+                let final_shape = current_sum.shape();
+                if !final_shape.is_empty() {
+                    return Err(Error::InternalLogicError(format!(
+                        "Global sum did not result in a scalar. Final shape: {:?}",
+                        final_shape
+                    )));
+                }
+
+                debug_println!(
+                    "Global sum calculated, shape: {:?}. Dividing by size {}...",
+                    final_shape,
+                    size
+                );
+                Self::div_scalar(&current_sum, size) // Use Self::div_scalar
+            }
+            Some(axis) => {
+                debug_println!("--- mean (Axis={}) START ---", axis);
+                let input_shape = x.shape();
+                if axis >= input_shape.len() {
+                    return Err(Error::InvalidIndex(vec![axis]));
+                }
+                let dim_size = *input_shape.get(axis).unwrap_or(&1).max(&1) as f32;
+                if dim_size == 0.0 {
+                    debug_println!("Mean along zero-sized axis {}, returning zeros", axis);
+                    let mut output_shape = input_shape.to_vec();
+                    if !output_shape.is_empty() {
+                        output_shape.remove(axis);
+                    }
+                    return Self::zeros(&output_shape); // Return empty tensor with same shape
+                }
+
+                debug_println!("Summing along axis {}...", axis);
+                let sum = Self::sum_along_axis(x, axis)?; // Use Self::sum_along_axis
+                debug_println!("Dividing sum by dim_size {}...", dim_size);
+                Self::div_scalar(&sum, dim_size) // Use Self::div_scalar
+            }
+        }
+    }
+
+    // --- Neural Network Specific Operations ---
+    fn relu(x: &Self::Storage) -> Result<Self::Storage, Error> {
+        let n = Self::size(x);
+        if n == 0 {
+            return CudaStorage::new(x.shape());
+        }
+        let mut output = CudaStorage::new(x.shape())?;
+
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("relu_kernel")
+            .ok_or_else(|| Error::CudaError("relu_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+
+        let block_size = 256;
+        let grid_size = n.div_ceil(block_size);
+
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(format!("relu kernel launch failed: {}", e)))?;
+        }
+
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(format!("Stream sync failed after relu: {}", e)))?;
+
+        Ok(output)
+    }
+    
+    fn elu(x: &Self::Storage, alpha: f32) -> Result<Self::Storage, Error> {
+        let n = Self::size(x);
+        if n == 0 {
+            return CudaStorage::new(x.shape());
+        }
+        let mut output = CudaStorage::new(x.shape())?;
+
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("elu_kernel")
+            .ok_or_else(|| Error::CudaError("elu_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+
+        let block_size = 256;
+        let grid_size = n.div_ceil(block_size);
+
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                alpha,
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(format!("elu kernel launch failed: {}", e)))?;
+        }
+
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(format!("Stream sync failed after elu: {}", e)))?;
+
+        Ok(output)
+    }
+
+    fn sigmoid(x: &Self::Storage) -> Result<Self::Storage, Error> {
+        let n = Self::size(x);
+        if n == 0 {
+            return CudaStorage::new(x.shape());
+        }
+        let mut output = CudaStorage::new(x.shape())?;
+        let ctx = get_global_context()?;
+        let kernel = ctx.get_kernel("sigmoid_kernel").ok_or_else(|| {
+            Error::CudaError("sigmoid_kernel not found. Check elementwise.cu/build.rs".to_string())
+        })?;
+        let stream = ctx.get_stream();
+        let block_size = 256;
+        let grid_size = n.div_ceil(block_size);
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(output)
+    }
+
+    fn log_softmax(x: &Self::Storage, axis: usize) -> Result<Self::Storage, Error> {
+        debug_println!(
+            "[DEBUG] log_softmax: input shape = {:?}, axis = {}",
+            x.shape(),
+            axis
+        );
+        let input_shape = x.shape();
+        let _input_ndim = input_shape.len();
+
+        if axis >= input_shape.len() {
+            return Err(Error::InvalidIndex(vec![axis]));
+        }
+        // Handle empty input tensor
+        if input_shape.iter().any(|&d| d == 0) {
+            return Self::zeros(input_shape); // Return empty tensor with same shape
+        }
+
+        // 1. Find max along the specified axis for numerical stability
+        let max_vals = Self::max_along_axis(x, axis)?; // Shape is reduced, e.g., [2] for input [2,3], axis=1
+        debug_println!(
+            "[DEBUG] log_softmax: max_vals shape = {:?}",
+            max_vals.shape()
+        );
+
+        // 2. Reshape max_vals to be compatible for broadcasting (insert singleton dim at axis)
+        let mut intermediate_shape = input_shape.to_vec();
+        intermediate_shape[axis] = 1; // e.g., [2, 1] for input [2, 3], axis=1
+
+        let mut max_vals_reshaped = max_vals.clone();
+        // Use set_shape carefully - only changes metadata, buffer size must match element count
+        max_vals_reshaped.set_shape(intermediate_shape.clone());
+        debug_println!(
+            "[DEBUG] log_softmax: max_vals_reshaped shape = {:?}",
+            max_vals_reshaped.shape()
+        );
+
+        // 3. Broadcast the reshaped max_vals and subtract from x
+        let max_broadcast = Self::broadcast_to(&max_vals_reshaped, input_shape)?;
+        debug_println!(
+            "[DEBUG] log_softmax: max_broadcast shape = {:?}",
+            max_broadcast.shape()
+        );
+        let shifted = Self::sub(x, &max_broadcast)?;
+        debug_println!("[DEBUG] log_softmax: shifted shape = {:?}", shifted.shape());
+
+        // 4. Compute exp(shifted)
+        let exp_vals = Self::exp(&shifted)?;
+        debug_println!(
+            "[DEBUG] log_softmax: exp_vals shape = {:?}",
+            exp_vals.shape()
+        );
+
+        // 5. Sum exp values along the axis
+        let sums = Self::sum_along_axis(&exp_vals, axis)?; // Shape is reduced, e.g., [2]
+        debug_println!("[DEBUG] log_softmax: sums shape = {:?}", sums.shape());
+
+        // 6. Reshape sums similar to max_vals
+        let mut sums_reshaped = sums.clone();
+        // intermediate_shape is already calculated above ([2, 1] in the example)
+        sums_reshaped.set_shape(intermediate_shape);
+
+        // 7. Broadcast the reshaped sums
+        let sums_broadcast = Self::broadcast_to(&sums_reshaped, input_shape)?;
+        debug_println!(
+            "[DEBUG] log_softmax: sums_broadcast shape = {:?}",
+            sums_broadcast.shape()
+        );
+
+        // 8. Compute final result: shifted - ln(sums_broadcast)
+        let log_sums_broadcast = Self::ln(&sums_broadcast)?;
+        let output = Self::sub(&shifted, &log_sums_broadcast)?;
+
+        debug_println!(
+            "[DEBUG] log_softmax: finished, output shape = {:?}",
+            output.shape()
+        );
+        Ok(output) // Return the result calculated using backend ops
+    }
+
+    // --- Backward Operations for Autograd ---
+    fn matmul_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<(Self::Storage, Self::Storage), Error> {
+        eprintln!("[!!!] ENTERING CudaBackend::matmul_backward (Corrected Version) [!!!]");
+
+        if op.inputs.len() != 2 {
+            return Err(Error::InvalidOperation(
+                "Matmul requires 2 inputs".to_string(),
+            ));
+        }
+
+        let a_ref = op.inputs[0].data(); // Original A [m, k]
+        let b_ref = op.inputs[1].data(); // Original B [k, n]
+        let a = &*a_ref;
+        let b = &*b_ref;
+        let a_shape = Self::shape(a); // [m, k]
+        let b_shape = Self::shape(b); // [k, n]
+        let d_shape = Self::shape(output_grad); // [m, n]
+
+        if a_shape.len() != 2 || b_shape.len() != 2 || d_shape.len() != 2 {
+            return Err(Error::InvalidOperation(
+                "matmul_backward requires 2D tensors".into(),
+            ));
+        }
+        let m = a_shape[0];
+        let k = a_shape[1]; // Also b_shape[0]
+        let n = b_shape[1];
+        if d_shape[0] != m || d_shape[1] != n {
+            return Err(Error::IncompatibleShapes {
+                op: "matmul_backward grad shape mismatch".into(),
+                shape_a: d_shape.to_vec(),
+                shape_b: vec![m, n],
+            });
+        }
+
+        // --- Calculate grad_A = D @ B^T ---
+        eprintln!("\n[matmul_backward][CUDA] Calculating grad_A = D @ B^T via grad_A^T = B @ D^T");
+        let mut grad_a = CudaStorage::new(&[m, k])?;
+        let ctx_ga = get_global_context()?;
+        let handle_ga = ctx_ga.get_cublas_handle();
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        let status_ga = unsafe {
+            cublas_sys::cublasSgemm_v2(
+                handle_ga,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T, // op(B) = D^T
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N, // op(A) = B
+                k as i32,                                   // m: rows of B
+                m as i32,                                   // n: rows of D
+                n as i32,                                   // k: cols of B / cols of D
+                &alpha,
+                output_grad.as_ptr().as_raw() as *const f32, // D
+                n as i32,                                    // ldb = leading dim of D
+                b.as_ptr().as_raw() as *const f32,           // B
+                n as i32,                                    // lda = leading dim of B
+                &beta,
+                grad_a.as_mut_ptr().as_raw() as *mut f32, // grad_A (as transposed)
+                m as i32,                                 // ldc = leading dim of grad_A^T
+            )
+        };
+        if status_ga != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(Error::CublasError(format!(
+                "cuBLAS Sgemm failed for grad_A: {:?}",
+                status_ga
+            )));
+        }
+        ctx_ga
+            .get_stream()
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        if let Ok(data) = Self::copy_to_host(&grad_a) {
+            eprintln!(
+                "[matmul_backward][DEBUG]   Result grad_A data sample: {:?}",
+                &data[..data.len().min(4)]
+            );
+        }
+
+        // --- Calculate grad_B = A^T @ D ---
+        eprintln!("\n[matmul_backward][CUDA] Calculating grad_B = A^T @ D via grad_B^T = D^T @ A");
+        let mut grad_b = CudaStorage::new(&[k, n])?;
+        let ctx_gb = get_global_context()?;
+        let handle_gb = ctx_gb.get_cublas_handle();
+        let status_gb = unsafe {
+            cublas_sys::cublasSgemm_v2(
+                handle_gb,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N, // op(B) = A
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T, // op(A) = D^T
+                n as i32,                                   // m: rows of D^T
+                k as i32,                                   // n: rows of A
+                m as i32,                                   // k: inner dim = rows of D
+                &alpha,
+                a.as_ptr().as_raw() as *const f32,           // A
+                k as i32,                                    // ldb = leading dim of A
+                output_grad.as_ptr().as_raw() as *const f32, // D
+                n as i32,                                    // lda = leading dim of D
+                &beta,
+                grad_b.as_mut_ptr().as_raw() as *mut f32, // grad_B (as transposed)
+                k as i32,                                 // ldc = leading dim of grad_B^T
+            )
+        };
+        if status_gb != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(Error::CublasError(format!(
+                "cuBLAS Sgemm failed for grad_B: {:?}",
+                status_gb
+            )));
+        }
+        ctx_gb
+            .get_stream()
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        if let Ok(data) = Self::copy_to_host(&grad_b) {
+            eprintln!(
+                "[matmul_backward][DEBUG]   Result grad_B data sample: {:?}",
+                &data[..data.len().min(4)]
+            );
+        }
+
+        // Transpose results to match row-major layout
+        let grad_a = Self::transpose(&grad_a)?;
+        let grad_b = Self::transpose(&grad_b)?;
+        eprintln!(
+            "[matmul_backward][DEBUG] grad_a after transpose: {:?}",
+            Self::copy_to_host(&grad_a).ok()
+        );
+        eprintln!(
+            "[matmul_backward][DEBUG] grad_b after transpose: {:?}",
+            Self::copy_to_host(&grad_b).ok()
+        );
+        eprintln!("[matmul_backward][DEBUG] EXIT");
+        Ok((grad_a, grad_b))
+    }
+
+    fn mul_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<(Self::Storage, Self::Storage), Error> {
+        if op.inputs.len() != 2 {
+            return Err(Error::InvalidOperation("Mul requires 2 inputs".to_string()));
+        }
+        let a = &*op.inputs[0].data();
+        let b = &*op.inputs[1].data();
+
+        debug_println!(
+            "[mul_backward][CUDA] output_grad shape: {:?}",
+            Self::shape(output_grad)
+        );
+        if let Ok(_data_vec) = Self::copy_to_host(output_grad) {
+            debug_println!(
+                "[mul_backward][CUDA] output_grad data sample: {:?}",
+                &_data_vec[.._data_vec.len().min(5)]
+            );
+        }
+        debug_println!("[mul_backward][CUDA] a shape: {:?}", Self::shape(a));
+        debug_println!("[mul_backward][CUDA] b shape: {:?}", Self::shape(b));
+
+        let grad_a_potentially_broadcasted = Self::mul(output_grad, b)?;
+        debug_println!(
+            "[mul_backward][CUDA] grad_a_potentially_broadcasted shape: {:?}",
+            Self::shape(&grad_a_potentially_broadcasted)
+        );
+        if let Ok(_data_vec) = Self::copy_to_host(&grad_a_potentially_broadcasted) {
+            debug_println!(
+                "[mul_backward][CUDA] grad_a_potentially_broadcasted data sample: {:?}",
+                &_data_vec[.._data_vec.len().min(5)]
+            );
+        }
+
+        let grad_b_potentially_broadcasted = Self::mul(output_grad, a)?;
+        debug_println!(
+            "[mul_backward][CUDA] grad_b_potentially_broadcasted shape: {:?}",
+            Self::shape(&grad_b_potentially_broadcasted)
+        );
+        if let Ok(_data_vec) = Self::copy_to_host(&grad_b_potentially_broadcasted) {
+            debug_println!(
+                "[mul_backward][CUDA] grad_b_potentially_broadcasted data sample: {:?}",
+                &_data_vec[.._data_vec.len().min(5)]
+            );
+        }
+
+        let grad_a = cuda_unbroadcast(grad_a_potentially_broadcasted, a.shape())?;
+        let grad_b = cuda_unbroadcast(grad_b_potentially_broadcasted, b.shape())?;
+
+        Ok((grad_a, grad_b))
+    }
+
+    fn mean_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<Self::Storage, Error> {
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!("[CudaBackend::mean_backward][CUDA] ENTER");
+            println!(
+                "[CudaBackend::mean_backward][CUDA] OpType: {:?}",
+                op.op_type
+            );
+            println!(
+                "[CudaBackend::mean_backward][CUDA] Output grad shape: {:?}",
+                Self::shape(output_grad)
+            );
+            if let Ok(_data_vec) = CudaBackend::copy_to_host(output_grad) {
+                println!(
+                    "[CudaBackend::mean_backward][CUDA] Output grad data sample: {:?} ... {:?}",
+                    &_data_vec[.._data_vec.len().min(5)],
+                    &_data_vec[_data_vec.len().saturating_sub(5)..]
+                );
+            }
+        }
+
+        if op.inputs.is_empty() {
+            #[cfg(feature = "cuda")]
+            {
+                use std::println;
+                println!("[CudaBackend::mean_backward][CUDA] ERROR: No inputs found");
+            }
+            return Err(Error::InvalidOperation("Mean requires 1 input".to_string()));
+        }
+        let input = &*op.inputs[0].data();
+        let input_shape = Self::shape(input);
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[CudaBackend::mean_backward][CUDA] Input shape: {:?}",
+                input_shape
+            );
+        }
+
+        // Get the scale factor and reduced axes based on op type
+        let (scale, reduced_axes): (f32, Vec<usize>) = match op.op_type {
+            OpType::Mean(None) => {
+                let input_size = Self::size(input).max(1) as f32;
+                #[cfg(feature = "cuda")]
+                {
+                    use std::println;
+                    println!("[CudaBackend::mean_backward][CUDA] Global mean. Scale factor (1/N): 1.0 / {}", input_size);
+                }
+                if input_size == 0.0 {
+                    return CudaStorage::zeros(input_shape);
+                }
+                (input_size, (0..input_shape.len()).collect())
+            }
+            OpType::Mean(Some(axis)) => {
+                if axis >= input_shape.len() {
+                    #[cfg(feature = "cuda")]
+                    {
+                        use std::println;
+                        println!(
+                            "[CudaBackend::mean_backward][CUDA] ERROR: Invalid axis {}",
+                            axis
+                        );
+                    }
+                    return Err(Error::InvalidIndex(vec![axis]));
+                }
+                let dim_size = *input_shape.get(axis).unwrap_or(&1).max(&1) as f32;
+                #[cfg(feature = "cuda")]
+                {
+                    use std::println;
+                    println!("[CudaBackend::mean_backward][CUDA] Axis {} mean. Scale factor (1/M): 1.0 / {}", axis, dim_size);
+                }
+                if dim_size == 0.0 {
+                    return CudaStorage::zeros(input_shape);
+                }
+                (dim_size, vec![axis])
+            }
+            _ => {
+                #[cfg(feature = "cuda")]
+                {
+                    use std::println;
+                    println!(
+                        "[CudaBackend::mean_backward][CUDA] ERROR: Incorrect OpType {:?}",
+                        op.op_type
+                    );
+                }
+                return Err(Error::InternalLogicError(format!(
+                    "mean_backward called with incorrect OpType: {:?}",
+                    op.op_type
+                )));
+            }
+        };
+
+        // For scalar input (shape []), we can directly scale the gradient
+        if input_shape.is_empty() {
+            #[cfg(feature = "cuda")]
+            {
+                use std::println;
+                println!("[CudaBackend::mean_backward][CUDA] Scalar input case.");
+            }
+            if !Self::shape(output_grad).is_empty() {
+                return Err(Error::InternalLogicError(format!(
+                    "mean_backward(None) received non-scalar gradient for scalar input, shape: {:?}",
+                    Self::shape(output_grad)
+                )));
+            }
+            #[cfg(feature = "cuda")]
+            {
+                use std::println;
+                println!(
+                    "[CudaBackend::mean_backward][CUDA] Dividing output_grad by scale {}",
+                    scale
+                );
+            }
+            let result = Self::div_scalar(output_grad, scale)?;
+            #[cfg(feature = "cuda")]
+            {
+                use std::println;
+                println!(
+                    "[CudaBackend::mean_backward][CUDA] Result shape: {:?}",
+                    Self::shape(&result)
+                );
+                if let Ok(_data_vec) = CudaBackend::copy_to_host(&result) {
+                    println!(
+                        "[CudaBackend::mean_backward][CUDA] Result data sample: {:?} ... {:?}",
+                        &_data_vec[.._data_vec.len().min(5)],
+                        &_data_vec[_data_vec.len().saturating_sub(5)..]
+                    );
+                }
+            }
+            return Ok(result);
+        }
+
+        // --- Broadcasting Logic ---
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!("[CudaBackend::mean_backward][CUDA] Broadcasting gradient...");
+        }
+        // Create an intermediate shape with 1s at reduced axes
+        let mut grad_shape_with_ones = input_shape.to_vec();
+        for &axis in &reduced_axes {
+            if axis < grad_shape_with_ones.len() {
+                grad_shape_with_ones[axis] = 1;
+            }
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[CudaBackend::mean_backward][CUDA] Target reshape for grad: {:?}",
+                grad_shape_with_ones
+            );
+        }
+
+        let reshaped_grad = if Self::shape(output_grad).is_empty()
+            && op.op_type == OpType::Mean(None)
+        {
+            #[cfg(feature = "cuda")]
+            {
+                use std::println;
+                println!("[CudaBackend::mean_backward][CUDA] Handling scalar output_grad for global mean.");
+            }
+            // If output_grad is scalar [], we need to create a tensor with the intermediate shape [1, 1,...]
+            // filled with the scalar value before broadcasting
+            let scalar_val_vec = Self::copy_to_host(output_grad)?;
+            if scalar_val_vec.is_empty() {
+                return Err(Error::InternalLogicError("Scalar grad is empty".into()));
+            }
+            let scalar_val = scalar_val_vec[0];
+            // Create intermediate storage filled with the scalar value
+            let size_intermediate = grad_shape_with_ones.iter().product();
+            let filled_data = vec![scalar_val; size_intermediate];
+            let result = Self::from_vec(filled_data, &grad_shape_with_ones)?;
+            #[cfg(feature = "cuda")]
+            {
+                use std::println;
+                println!("[CudaBackend::mean_backward][CUDA] Created intermediate grad tensor with shape {:?} and value {}", grad_shape_with_ones, scalar_val);
+            }
+            result
+        } else {
+            // For axis mean, output_grad already has the reduced shape, just need to insert 1s
+            let mut reshaped = output_grad.clone();
+            reshaped.set_shape(grad_shape_with_ones);
+            #[cfg(feature = "cuda")]
+            {
+                use std::println;
+                println!("[CudaBackend::mean_backward][CUDA] Reshaped output_grad (axis mean case) to {:?}", Self::shape(&reshaped));
+            }
+            reshaped
+        };
+
+        // Broadcast to full input shape
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[CudaBackend::mean_backward][CUDA] Broadcasting reshaped grad to input shape {:?}",
+                input_shape
+            );
+        }
+        let grad_broadcasted = Self::broadcast_to(&reshaped_grad, input_shape)?;
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[CudaBackend::mean_backward][CUDA] Broadcasted grad shape: {:?}",
+                Self::shape(&grad_broadcasted)
+            );
+        }
+
+        // Divide by scale
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[CudaBackend::mean_backward][CUDA] Dividing broadcasted grad by scale {}",
+                scale
+            );
+        }
+        let final_grad = Self::div_scalar(&grad_broadcasted, scale)?;
+
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[CudaBackend::mean_backward][CUDA] Final grad shape: {:?}",
+                Self::shape(&final_grad)
+            );
+            if let Ok(_data_vec) = CudaBackend::copy_to_host(&final_grad) {
+                println!(
+                    "[CudaBackend::mean_backward][CUDA] Final grad data sample: {:?} ... {:?}",
+                    &_data_vec[.._data_vec.len().min(5)],
+                    &_data_vec[_data_vec.len().saturating_sub(5)..]
+                );
+            }
+            println!("[CudaBackend::mean_backward][CUDA] EXIT");
+        }
+        Ok(final_grad)
+    }
+
+    fn relu_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<Self::Storage, Error> {
+        if op.inputs.is_empty() {
+            return Err(Error::InvalidOperation("Relu requires 1 input".to_string()));
+        }
+        let input = &*op.inputs[0].data();
+
+        let n = input.len();
+        if n == 0 {
+            return CudaStorage::new(input.shape());
+        }
+        let mut grad_input = CudaStorage::new(input.shape())?;
+
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("relu_backward_kernel")
+            .ok_or_else(|| Error::CudaError("relu_backward_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+        let block_size = 256;
+        let grid_size = n.div_ceil(block_size);
+
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                input.as_ptr(),
+                output_grad.as_ptr(),
+                grad_input.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(grad_input)
+    }
+
+    fn log_softmax_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<Self::Storage, Error> {
+        if op.inputs.is_empty() {
+            return Err(Error::InvalidOperation(
+                "LogSoftmax requires 1 input".to_string(),
+            ));
+        }
+
+        let input_data_ref = op.inputs[0].data();
+        let input_data = &*input_data_ref;
+        let input_shape = Self::shape(input_data);
+        let axis = match op.op_type {
+            OpType::LogSoftmax(axis) => axis,
+            _ => {
+                return Err(Error::InternalLogicError(
+                    "Expected LogSoftmax op type for backward pass".to_string(),
+                ))
+            }
+        };
+
+        // The gradient formula is: grad_input = grad_output - exp(log_softmax(x)) * sum(grad_output along axis)
+        // which simplifies to: grad_input = grad_output - softmax(x) * sum(grad_output along axis)
+
+        // Recompute softmax probabilities (p = exp(log_softmax(x)))
+        // Need to compute log_softmax first. Since log_softmax needs gradients later,
+        // we ideally should have stored the forward output. But since we don't, recompute it.
+        // This is less efficient but correct for now.
+        let log_softmax_output = Self::log_softmax(input_data, axis)?;
+        let p = Self::exp(&log_softmax_output)?; // p = softmax(x)
+
+        // Calculate sum(grad_output) along the specified axis
+        let sum_grad = Self::sum_along_axis(output_grad, axis)?; // Shape is reduced
+
+        // Reshape sum_grad to be compatible for broadcasting (insert singleton dim at axis)
+        let mut intermediate_shape = input_shape.to_vec();
+        intermediate_shape[axis] = 1; // e.g., [2, 1] for input [2, 3], axis=1
+
+        let mut sum_grad_reshaped = sum_grad.clone();
+        // Use set_shape carefully - only changes metadata, buffer size must match element count
+        sum_grad_reshaped.set_shape(intermediate_shape.clone());
+        debug_println!(
+            "[DEBUG] log_softmax_backward: sum_grad_reshaped shape = {:?}",
+            sum_grad_reshaped.shape()
+        );
+
+        // Broadcast sum_grad back to the original input shape
+        let sum_grad_broadcast = Self::broadcast_to(&sum_grad_reshaped, input_shape)?;
+
+        // Calculate the second term: p * sum_grad_broadcast
+        let term2 = Self::mul(&p, &sum_grad_broadcast)?;
+
+        // Calculate final gradient: grad_input = output_grad - term2
+        let grad_input = Self::sub(output_grad, &term2)?;
+
+        Ok(grad_input)
+    }
+
+    fn sum_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<Self::Storage, Error> {
+        if op.inputs.len() != 1 {
+            return Err(Error::InvalidOperation(format!(
+                "Sum operation backward expected 1 input, found {}",
+                op.inputs.len()
+            )));
+        }
+        let input = &*op.inputs[0].data();
+        let input_shape = Self::shape(input);
+
+        match op.op_type {
+            OpType::Sum(None) => {
+                // Global sum: output_grad is scalar. Broadcast it directly.
+                // Ensure output_grad IS scalar before broadcasting
+                if !Self::shape(output_grad).is_empty() {
+                    return Err(Error::InternalLogicError(format!(
+                        "sum_backward(None) received non-scalar gradient, shape: {:?}",
+                        Self::shape(output_grad)
+                    )));
+                }
+                Self::broadcast_to(output_grad, input_shape)
+            }
+            OpType::Sum(Some(axis)) => {
+                // Axis sum: output_grad has reduced shape. Reshape and broadcast.
+
+                // Calculate the expected shape of the output_grad (input shape with axis removed)
+                let mut expected_reduced_shape = input_shape.to_vec();
+                if axis < expected_reduced_shape.len() {
+                    expected_reduced_shape.remove(axis);
+                } else {
+                    // Axis out of bounds for input shape
+                    return Err(Error::InvalidIndex(vec![axis]));
+                }
+
+                // Validate the actual output_grad shape
+                let actual_grad_shape = Self::shape(output_grad);
+                if actual_grad_shape != expected_reduced_shape.as_slice() {
+                    return Err(Error::ShapeMismatch {
+                        expected: expected_reduced_shape,
+                        actual: actual_grad_shape.to_vec(),
+                    });
+                }
+
+                // Calculate the target shape for reshaping (input shape with size 1 at axis)
+                let mut grad_shape_with_ones = input_shape.to_vec();
+                if axis < grad_shape_with_ones.len() {
+                    grad_shape_with_ones[axis] = 1;
+                } else {
+                    // Axis out of bounds check already implicitly done above
+                    // but being explicit might be clearer, though redundant here.
+                    return Err(Error::InvalidIndex(vec![axis]));
+                }
+
+                let mut reshaped_grad = output_grad.clone();
+                // Set the shape metadata to include the singleton dimension
+                reshaped_grad.set_shape(grad_shape_with_ones); // Reshape metadata
+
+                Self::broadcast_to(&reshaped_grad, input_shape) // Broadcast data
+            }
+            _ => Err(Error::InternalLogicError(
+                "Incorrect OpType for sum_backward".into(),
+            )),
+        }
+    }
+
+    fn add_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<(Self::Storage, Self::Storage), Error> {
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!("[CudaBackend::add_backward][CUDA] ENTER");
+        }
+
+        if op.inputs.len() != 2 {
+            #[cfg(feature = "cuda")]
+            {
+                use std::println;
+                println!(
+                    "[CudaBackend::add_backward][CUDA] ERROR: Expected 2 inputs, got {}",
+                    op.inputs.len()
+                );
+            }
+            return Err(Error::InvalidOperation("Add requires 2 inputs".to_string()));
+        }
+
+        let a_data_ref = op.inputs[0].data();
+        let b_data_ref = op.inputs[1].data();
+        let a = &*a_data_ref;
+        let b = &*b_data_ref;
+        let a_shape = Self::shape(a).to_vec();
+        let b_shape = Self::shape(b).to_vec();
+        let output_grad_shape = Self::shape(output_grad).to_vec();
+
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[CudaBackend::add_backward][CUDA] Input shapes: a={:?}, b={:?}",
+                a_shape, b_shape
+            );
+            println!(
+                "[CudaBackend::add_backward][CUDA] Output grad shape: {:?}",
+                output_grad_shape
+            );
+            if let Ok(_data_vec) = CudaBackend::copy_to_host(output_grad) {
+                println!(
+                    "[CudaBackend::add_backward][CUDA] output_grad data sample: {:?} ... {:?}",
+                    &_data_vec[.._data_vec.len().min(5)],
+                    &_data_vec[_data_vec.len().saturating_sub(5)..]
+                );
+            }
+            if let Ok(_data_vec) = CudaBackend::copy_to_host(a) {
+                println!(
+                    "[CudaBackend::add_backward][CUDA] input a data sample: {:?} ... {:?}",
+                    &_data_vec[.._data_vec.len().min(5)],
+                    &_data_vec[_data_vec.len().saturating_sub(5)..]
+                );
+            }
+            if let Ok(_data_vec) = CudaBackend::copy_to_host(b) {
+                println!(
+                    "[CudaBackend::add_backward][CUDA] input b data sample: {:?} ... {:?}",
+                    &_data_vec[.._data_vec.len().min(5)],
+                    &_data_vec[_data_vec.len().saturating_sub(5)..]
+                );
+            }
+        }
+
+        let grad_a_potentially_broadcasted = output_grad.clone();
+        let grad_b_potentially_broadcasted = output_grad.clone();
+
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!("[CudaBackend::add_backward][CUDA] Initial grads (cloned from output_grad) shape: {:?}", 
+                Self::shape(&grad_a_potentially_broadcasted));
+            println!(
+                "  - grad_a shape: {:?} (target: {:?})",
+                Self::shape(&grad_a_potentially_broadcasted),
+                a_shape
+            );
+            println!(
+                "  - grad_b shape: {:?} (target: {:?})",
+                Self::shape(&grad_b_potentially_broadcasted),
+                b_shape
+            );
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!("[CudaBackend::add_backward][CUDA] Calling unbroadcast for grad_a (target shape: {:?})", a_shape);
+        }
+        let grad_a = cuda_unbroadcast(grad_a_potentially_broadcasted, &a_shape)?;
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[CudaBackend::add_backward][CUDA] Result grad_a shape after unbroadcast: {:?}",
+                Self::shape(&grad_a)
+            );
+            if let Ok(_data_vec) = CudaBackend::copy_to_host(&grad_a) {
+                println!(
+                    "[CudaBackend::add_backward][CUDA] Result grad_a data sample: {:?} ... {:?}",
+                    &_data_vec[.._data_vec.len().min(5)],
+                    &_data_vec[_data_vec.len().saturating_sub(5)..]
+                );
+            }
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!("[CudaBackend::add_backward][CUDA] Calling unbroadcast for grad_b (target shape: {:?})", b_shape);
+        }
+        let grad_b = cuda_unbroadcast(grad_b_potentially_broadcasted, &b_shape)?;
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!(
+                "[CudaBackend::add_backward][CUDA] Result grad_b shape after unbroadcast: {:?}",
+                Self::shape(&grad_b)
+            );
+            if let Ok(_data_vec) = CudaBackend::copy_to_host(&grad_b) {
+                println!(
+                    "[CudaBackend::add_backward][CUDA] Result grad_b data sample: {:?} ... {:?}",
+                    &_data_vec[.._data_vec.len().min(5)],
+                    &_data_vec[_data_vec.len().saturating_sub(5)..]
+                );
+            }
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            use std::println;
+            println!("[CudaBackend::add_backward][CUDA] EXIT");
+        }
+        Ok((grad_a, grad_b))
+    }
+
+    fn div_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<(Self::Storage, Self::Storage), Error> {
+        if op.inputs.len() != 2 {
+            return Err(Error::InvalidOperation("Div requires 2 inputs".to_string()));
+        }
+        let a = &*op.inputs[0].data();
+        let b = &*op.inputs[1].data();
+
+        // For division a/b:
+        // da = dout * (1/b)
+        // db = dout * (-a/b^2)
+        let ones = &Self::ones(b.shape())?;
+        let reciprocal_b = Self::div(ones, b)?;
+        let b_squared = Self::mul(b, b)?;
+        let neg_a_over_b_squared = Self::div_scalar(&Self::div(a, &b_squared)?, -1.0)?;
+
+        // Calculate gradients with broadcasting
+        let grad_a_potentially_broadcasted = Self::mul(output_grad, &reciprocal_b)?;
+        let grad_b_potentially_broadcasted = Self::mul(output_grad, &neg_a_over_b_squared)?;
+
+        // Unbroadcast if needed
+        let grad_a = cuda_unbroadcast(grad_a_potentially_broadcasted, a.shape())?;
+        let grad_b = cuda_unbroadcast(grad_b_potentially_broadcasted, b.shape())?;
+
+        Ok((grad_a, grad_b))
+    }
+
+    fn sub_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<(Self::Storage, Self::Storage), Error> {
+        if op.inputs.len() != 2 {
+            return Err(Error::InvalidOperation("Sub requires 2 inputs".to_string()));
+        }
+        let a = &*op.inputs[0].data();
+        let b = &*op.inputs[1].data();
+
+        // For subtraction a-b:
+        // da = dout
+        // db = -dout
+        let grad_a_potentially_broadcasted = output_grad.clone();
+        let grad_b_potentially_broadcasted = Self::div_scalar(output_grad, -1.0)?;
+
+        // Unbroadcast if needed
+        let grad_a = cuda_unbroadcast(grad_a_potentially_broadcasted, a.shape())?;
+        let grad_b = cuda_unbroadcast(grad_b_potentially_broadcasted, b.shape())?;
+
+        Ok((grad_a, grad_b))
+    }
+
+    fn exp_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<Self::Storage, Error> {
+        if op.inputs.is_empty() {
+            return Err(Error::InvalidOperation("Exp requires 1 input".to_string()));
+        }
+
+        // For exp(x), the gradient is: grad_in = grad_out * exp(x)
+        // Note: This can legitimately produce Inf for large x, which is expected behavior
+        let x = &*op.inputs[0].data();
+        let exp_x = Self::exp(x)?;
+
+        // Compute gradient, allowing Inf results for numerical stability
+        let grad = Self::mul(output_grad, &exp_x)?;
+
+        // Unbroadcast if needed - this preserves Inf values while handling shape adjustments
+        cuda_unbroadcast(grad, x.shape())
+    }
+
+    fn ln_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<Self::Storage, Error> {
+        if op.inputs.is_empty() {
+            return Err(Error::InvalidOperation("Ln requires 1 input".to_string()));
+        }
+        let x = &*op.inputs[0].data();
+
+        // For ln(x), the gradient is: grad_in = grad_out * (1/x)
+        let ones = &Self::ones(x.shape())?;
+        let reciprocal_x = Self::div(ones, x)?;
+        let grad = Self::mul(output_grad, &reciprocal_x)?;
+
+        // Unbroadcast if needed
+        cuda_unbroadcast(grad, x.shape())
+    }
+
+    fn abs(x: &Self::Storage) -> Result<Self::Storage, Error> {
+        let n = x.len();
+        if n == 0 {
+            return CudaStorage::new(x.shape());
+        }
+        let mut output = CudaStorage::new(x.shape())?;
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("abs_kernel")
+            .ok_or_else(|| Error::CudaError("abs_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+        let block_size = 256;
+        let grid_size = n.div_ceil(block_size);
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(output)
+    }
+
+    fn abs_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<Self::Storage, Error> {
+        if op.inputs.is_empty() {
+            return Err(Error::InvalidOperation("Abs requires 1 input".to_string()));
+        }
+        let input_data_ref = op.inputs[0].data();
+        let input_data = &*input_data_ref;
+        let n = input_data.len();
+        if n == 0 {
+            return CudaStorage::new(input_data.shape());
+        }
+        let mut grad_input = CudaStorage::new(input_data.shape())?;
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("abs_backward_kernel")
+            .ok_or_else(|| Error::CudaError("abs_backward_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+        let block_size = 256;
+        let grid_size = n.div_ceil(block_size);
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                input_data.as_ptr(),
+                output_grad.as_ptr(),
+                grad_input.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(grad_input)
+    }
+
+    fn sigmoid_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<Self::Storage, Error> {
+        if op.inputs.is_empty() {
+            return Err(Error::InvalidOperation(
+                "Sigmoid requires 1 input".to_string(),
+            ));
+        }
+        let input_data_ref = op.inputs[0].data();
+        let input_data = &*input_data_ref; // x
+
+        let n = input_data.len();
+        if n == 0 {
+            return CudaStorage::new(input_data.shape());
+        }
+        let mut grad_input = CudaStorage::new(input_data.shape())?;
+
+        // Recompute sigmoid output y needed for backward pass
+        let y = Self::sigmoid(input_data)?;
+
+        let ctx = get_global_context()?;
+        let kernel = ctx.get_kernel("sigmoid_backward_kernel").ok_or_else(|| {
+            Error::CudaError(
+                "sigmoid_backward_kernel not found. Check elementwise.cu/build.rs".to_string(),
+            )
+        })?;
+        let stream = ctx.get_stream();
+        let block_size = 256;
+        let grid_size = n.div_ceil(block_size);
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                y.as_ptr(), // Pass the computed sigmoid output 'y'
+                output_grad.as_ptr(),
+                grad_input.as_mut_ptr(),
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(e.to_string()))?;
+        Ok(grad_input)
+    }
+
+    // --- START: Added Placeholders for Task 2.6 ---
+    fn max(x: &Self::Storage, axis: Option<usize>) -> Result<Self::Storage, Error> {
+        match axis {
+            Some(ax) => {
+                println!("=========== DEBUG MAX FUNCTION START ===========");
+                println!("[DEBUG max] Input shape: {:?}", x.shape());
+                println!("[DEBUG max] Reduction axis: {}", ax);
+
+                println!("[DEBUG max] Attempting to get global context...");
+                let ctx = match get_global_context() {
+                    Ok(c) => {
+                        println!("[DEBUG max] Successfully got global context");
+                        c
+                    }
+                    Err(e) => {
+                        println!("[DEBUG max] FAILED to get global context: {:?}", e);
+                        return Err(e);
+                    }
+                };
+
+                println!("[DEBUG max] Looking for kernel 'max_reduction_kernel'");
+                let kernel = match ctx.get_kernel("max_reduction_kernel") {
+                    Some(k) => {
+                        println!("[DEBUG max] Successfully got kernel");
+                        k
+                    }
+                    None => {
+                        let err = Error::CudaError("max_reduction_kernel not found".to_string());
+                        println!("[DEBUG max] FAILED to get kernel: {:?}", err);
+                        return Err(err);
+                    }
+                };
+
+                let input_shape = x.shape();
+                println!("[DEBUG max] Computing output shape for axis {}", ax);
+                let output_shape = match compute_reduction_shape(input_shape, Some(ax))
+                {
+                    Ok(shape) => {
+                        println!("[DEBUG max] Output shape: {:?}", shape);
+                        shape
+                    }
+                    Err(e) => {
+                        println!("[DEBUG max] FAILED to compute output shape: {:?}", e);
+                        return Err(e);
+                    }
+                };
+
+                if input_shape.len() != 2 {
+                    return Err(Error::InvalidOperation(format!(
+                        "max reduction along axis currently only supports 2D tensors, got shape {:?}",
+                        input_shape
+                    )));
+                }
+
+                println!(
+                    "[DEBUG max] Creating output zeros tensor with shape {:?}",
+                    output_shape
+                );
+                let mut output = match Self::zeros(&output_shape) {
+                    Ok(o) => {
+                        println!("[DEBUG max] Successfully created output tensor");
+                        o
+                    }
+                    Err(e) => {
+                        println!("[DEBUG max] FAILED to create output tensor: {:?}", e);
+                        return Err(e);
+                    }
+                };
+
+                let block_size = 256;
+                let n_elements = Self::size(x);
+                println!("[DEBUG max] Total input elements: {}", n_elements);
+
+                // For 2D tensors, we use the following integer array structure:
+                // dims[0] = total number of elements (for bounds checking)
+                // dims[1] = number of rows
+                // dims[2] = number of columns
+                // dims[3] = axis to reduce along (0 or 1)
+                let rows = input_shape[0];
+                let cols = input_shape[1];
+
+                // Create a buffer with shape information for the kernel
+                let dims_info = vec![
+                    n_elements as i32, // Total elements
+                    rows as i32,       // Number of rows
+                    cols as i32,       // Number of columns
+                    ax as i32,         // Axis to reduce along
+                ];
+                println!("[DEBUG max] Passing shape info: dims={:?}", dims_info);
+
+                let dims_dev = match to_device_buffer_generic(&dims_info) {
+                    Ok(buf) => {
+                        println!("[DEBUG max] Successfully created device buffer for shape info");
+                        buf
+                    }
+                    Err(e) => {
+                        println!(
+                            "[DEBUG max] FAILED to create device buffer for shape info: {:?}",
+                            e
+                        );
+                        return Err(e);
+                    }
+                };
+
+                // For axis reduction, only use as many threads as needed for the output dimension
+                let grid_size = match ax {
+                    0 => (cols + block_size - 1) / block_size, // If reducing along rows, we process columns
+                    1 => (rows + block_size - 1) / block_size, // If reducing along columns, we process rows
+                    _ => unreachable!(),
+                };
+                println!(
+                    "[DEBUG max] Grid size: {}, Block size: {}",
+                    grid_size, block_size
+                );
+
+                println!("[DEBUG max] Getting CUDA stream");
+                let stream = ctx.get_stream();
+
+                // Debug information before kernel launch
+                println!("[DEBUG max] Launching kernel 'max_reduction_kernel'");
+                println!("[DEBUG max] grid_size = {}", grid_size);
+                println!("[DEBUG max] block_size = {}", block_size);
+                println!(
+                    "[DEBUG max] shared_bytes = {}",
+                    (block_size * std::mem::size_of::<f32>()) as u32
+                );
+                println!(
+                    "[DEBUG max] input ptr = {:?}, shape = {:?}",
+                    x.as_ptr(),
+                    CudaBackend::shape(x)
+                );
+                println!(
+                    "[DEBUG max] output ptr = {:?}, shape = {:?}",
+                    output.as_mut_ptr(),
+                    CudaBackend::shape(&output)
+                );
+                println!("[DEBUG max] dims_dev ptr = {:?}", dims_dev.as_device_ptr());
+
+                // DEBUG: Print the expected launch syntax
+                println!("[DEBUG max] Expected syntax: launch!(kernel<<<{}, {}, {}, stream>>>(...args...))", 
+                    grid_size as u32, block_size as u32, (block_size * std::mem::size_of::<f32>()) as u32);
+
+                println!("[DEBUG max] Launching kernel...");
+                let launch_result = unsafe {
+                    let result = launch!(
+                        kernel<<<grid_size as u32, block_size as u32, (block_size * std::mem::size_of::<f32>()) as u32, stream>>>(
+                            x.as_ptr(),
+                            output.as_mut_ptr(),
+                            dims_dev.as_device_ptr(), // Now passing comprehensive shape info
+                            2 // ndim = 2 for 2D tensor
+                        )
+                    );
+                    match &result {
+                        Ok(_) => println!("[DEBUG max] Kernel launch successful"),
+                        Err(e) => println!("[DEBUG max] Kernel launch FAILED: {:?}", e),
+                    }
+                    result
+                };
+
+                if let Err(e) = launch_result {
+                    println!("[DEBUG max] Returning kernel launch error");
+                    return Err(Error::CudaError(e.to_string()));
+                }
+
+                println!("[DEBUG max] Synchronizing stream");
+                match stream.synchronize() {
+                    Ok(_) => println!("[DEBUG max] Stream synchronization successful"),
+                    Err(e) => {
+                        println!("[DEBUG max] Stream synchronization FAILED: {:?}", e);
+                        return Err(Error::CudaError(e.to_string()));
+                    }
+                }
+
+                println!("=========== DEBUG MAX FUNCTION END ===========");
+                Ok(output)
+            }
+            None => {
+                println!("[DEBUG max global] Performing global max reduction");
+                // Fix: Perform max reduction over each axis sequentially, but preserve the result correctly
+                let ndim = Self::shape(x).len();
+                println!(
+                    "[DEBUG max global] Input shape: {:?}, reducing along {} axes",
+                    Self::shape(x),
+                    ndim
+                );
+
+                // Do a direct API-level reduction to get a scalar max
+                // First create a temporary buffer to hold a single value
+                let temp_shape = Vec::new(); // Empty shape = scalar
+                let mut result = Self::from_vec(vec![std::f32::NEG_INFINITY], &temp_shape)?;
+
+                // Get the size of the input
+                let n_elements = Self::size(x);
+
+                // Get the device context and stream
+                let ctx = get_global_context()?;
+                let stream = ctx.get_stream();
+
+                // Create a launch configuration for a simple kernel to find maximum
+                let block_size = 256;
+                let grid_size = (n_elements + block_size - 1) / block_size;
+                let n_elements_i32 = vec![n_elements as i32];
+                let n_elements_dev = to_device_buffer_generic(&n_elements_i32)?;
+
+                // Get the kernel
+                let _kernel = ctx.get_kernel("max_reduction_kernel").ok_or_else(|| {
+                    Error::CudaError("max_reduction_kernel not found".to_string())
+                })?;
+
+                // Launch the kernel to compute the maximum directly
+                unsafe {
+                    launch!(
+                        _kernel<<<grid_size as u32, block_size as u32, (block_size * std::mem::size_of::<f32>()) as u32, stream>>>(
+                            x.as_ptr(),
+                            result.as_mut_ptr(),
+                            n_elements_dev.as_device_ptr(),
+                            1 // Just indicate it's a 1D array of elements
+                        )
+                    )?;
+                }
+                stream.synchronize()?;
+
+                println!(
+                    "[DEBUG max global] Final global reduction shape: {:?}",
+                    Self::shape(&result)
+                );
+
+                Ok(result)
+            }
+        }
+    }
+
+    fn min(x: &Self::Storage, axis: Option<usize>) -> Result<Self::Storage, Error> {
+        match axis {
+            Some(ax) => {
+                println!("=========== DEBUG MIN FUNCTION START ===========");
+                println!("[DEBUG min] Input shape: {:?}", x.shape());
+                println!("[DEBUG min] Reduction axis: {}", ax);
+
+                println!("[DEBUG min] Attempting to get global context...");
+                let ctx = match get_global_context() {
+                    Ok(c) => {
+                        println!("[DEBUG min] Successfully got global context");
+                        c
+                    }
+                    Err(e) => {
+                        println!("[DEBUG min] FAILED to get global context: {:?}", e);
+                        return Err(e);
+                    }
+                };
+
+                println!("[DEBUG min] Looking for kernel 'min_reduction_kernel'");
+                let kernel = match ctx.get_kernel("min_reduction_kernel") {
+                    Some(k) => {
+                        println!("[DEBUG min] Successfully got kernel");
+                        k
+                    }
+                    None => {
+                        let err = Error::CudaError("min_reduction_kernel not found".to_string());
+                        println!("[DEBUG min] FAILED to get kernel: {:?}", err);
+                        return Err(err);
+                    }
+                };
+
+                let input_shape = x.shape();
+                println!("[DEBUG min] Computing output shape for axis {}", ax);
+                let output_shape = match compute_reduction_shape(input_shape, Some(ax))
+                {
+                    Ok(shape) => {
+                        println!("[DEBUG min] Output shape: {:?}", shape);
+                        shape
+                    }
+                    Err(e) => {
+                        println!("[DEBUG min] FAILED to compute output shape: {:?}", e);
+                        return Err(e);
+                    }
+                };
+
+                if input_shape.len() != 2 {
+                    return Err(Error::InvalidOperation(format!(
+                        "min reduction along axis currently only supports 2D tensors, got shape {:?}",
+                        input_shape
+                    )));
+                }
+
+                println!(
+                    "[DEBUG min] Creating output zeros tensor with shape {:?}",
+                    output_shape
+                );
+                let mut output = match Self::zeros(&output_shape) {
+                    Ok(o) => {
+                        println!("[DEBUG min] Successfully created output tensor");
+                        o
+                    }
+                    Err(e) => {
+                        println!("[DEBUG min] FAILED to create output tensor: {:?}", e);
+                        return Err(e);
+                    }
+                };
+
+                let block_size = 256;
+                let n_elements = Self::size(x);
+                println!("[DEBUG min] Total input elements: {}", n_elements);
+
+                // For 2D tensors, we use the following integer array structure:
+                // dims[0] = total number of elements (for bounds checking)
+                // dims[1] = number of rows
+                // dims[2] = number of columns
+                // dims[3] = axis to reduce along (0 or 1)
+                let rows = input_shape[0];
+                let cols = input_shape[1];
+
+                // Create a buffer with shape information for the kernel
+                let dims_info = vec![
+                    n_elements as i32, // Total elements
+                    rows as i32,       // Number of rows
+                    cols as i32,       // Number of columns
+                    ax as i32,         // Axis to reduce along
+                ];
+                println!("[DEBUG min] Passing shape info: dims={:?}", dims_info);
+
+                let dims_dev = match to_device_buffer_generic(&dims_info) {
+                    Ok(buf) => {
+                        println!("[DEBUG min] Successfully created device buffer for shape info");
+                        buf
+                    }
+                    Err(e) => {
+                        println!(
+                            "[DEBUG min] FAILED to create device buffer for shape info: {:?}",
+                            e
+                        );
+                        return Err(e);
+                    }
+                };
+
+                // For axis reduction, only use as many threads as needed for the output dimension
+                let grid_size = match ax {
+                    0 => (cols + block_size - 1) / block_size, // If reducing along rows, we process columns
+                    1 => (rows + block_size - 1) / block_size, // If reducing along columns, we process rows
+                    _ => unreachable!(),
+                };
+                println!(
+                    "[DEBUG min] Grid size: {}, Block size: {}",
+                    grid_size, block_size
+                );
+
+                println!("[DEBUG min] Getting CUDA stream");
+                let stream = ctx.get_stream();
+
+                // Debug information before kernel launch
+                println!("[DEBUG min] Launching kernel 'min_reduction_kernel'");
+                println!("[DEBUG min] grid_size = {}", grid_size);
+                println!("[DEBUG min] block_size = {}", block_size);
+                println!(
+                    "[DEBUG min] shared_bytes = {}",
+                    (block_size * std::mem::size_of::<f32>()) as u32
+                );
+                println!(
+                    "[DEBUG min] input ptr = {:?}, shape = {:?}",
+                    x.as_ptr(),
+                    CudaBackend::shape(x)
+                );
+                println!(
+                    "[DEBUG min] output ptr = {:?}, shape = {:?}",
+                    output.as_mut_ptr(),
+                    CudaBackend::shape(&output)
+                );
+                println!("[DEBUG min] dims_dev ptr = {:?}", dims_dev.as_device_ptr());
+
+                // DEBUG: Print the expected launch syntax
+                println!("[DEBUG min] Expected syntax: launch!(kernel<<<{}, {}, {}, stream>>>(...args...))", 
+                    grid_size as u32, block_size as u32, (block_size * std::mem::size_of::<f32>()) as u32);
+
+                println!("[DEBUG min] Launching kernel...");
+                let launch_result = unsafe {
+                    let result = launch!(
+                        kernel<<<grid_size as u32, block_size as u32, (block_size * std::mem::size_of::<f32>()) as u32, stream>>>(
+                            x.as_ptr(),
+                            output.as_mut_ptr(),
+                            dims_dev.as_device_ptr(), // Now passing comprehensive shape info
+                            2 // ndim = 2 for 2D tensor
+                        )
+                    );
+                    match &result {
+                        Ok(_) => println!("[DEBUG min] Kernel launch successful"),
+                        Err(e) => println!("[DEBUG min] Kernel launch FAILED: {:?}", e),
+                    }
+                    result
+                };
+
+                if let Err(e) = launch_result {
+                    println!("[DEBUG min] Returning kernel launch error");
+                    return Err(Error::CudaError(e.to_string()));
+                }
+
+                println!("[DEBUG min] Synchronizing stream");
+                match stream.synchronize() {
+                    Ok(_) => println!("[DEBUG min] Stream synchronization successful"),
+                    Err(e) => {
+                        println!("[DEBUG min] Stream synchronization FAILED: {:?}", e);
+                        return Err(Error::CudaError(e.to_string()));
+                    }
+                }
+
+                println!("=========== DEBUG MIN FUNCTION END ===========");
+                Ok(output)
+            }
+            None => {
+                println!("[DEBUG min global] Performing global min reduction");
+                // Global reduction - more efficient direct implementation
+                let ndim = Self::shape(x).len();
+                println!(
+                    "[DEBUG min global] Input shape: {:?}, reducing along {} axes",
+                    Self::shape(x),
+                    ndim
+                );
+
+                // Do a direct API-level reduction to get a scalar min
+                // First create a temporary buffer to hold a single value
+                let temp_shape = Vec::new(); // Empty shape = scalar
+                let mut result = Self::from_vec(vec![std::f32::INFINITY], &temp_shape)?;
+
+                // Get the size of the input
+                let n_elements = Self::size(x);
+
+                // Get the device context and stream
+                let ctx = get_global_context()?;
+                let stream = ctx.get_stream();
+
+                // Create a launch configuration for a simple kernel to find minimum
+                let block_size = 256;
+                let grid_size = (n_elements + block_size - 1) / block_size;
+                let n_elements_i32 = vec![n_elements as i32];
+                let n_elements_dev = to_device_buffer_generic(&n_elements_i32)?;
+
+                // Get the kernel
+                let kernel = ctx.get_kernel("min_reduction_kernel").ok_or_else(|| {
+                    Error::CudaError("min_reduction_kernel not found".to_string())
+                })?;
+
+                // Launch the kernel to compute the minimum directly
+                unsafe {
+                    launch!(
+                        kernel<<<grid_size as u32, block_size as u32, (block_size * std::mem::size_of::<f32>()) as u32, stream>>>(
+                            x.as_ptr(),
+                            result.as_mut_ptr(),
+                            n_elements_dev.as_device_ptr(),
+                            1 // Just indicate it's a 1D array of elements
+                        )
+                    )?;
+                }
+                stream.synchronize()?;
+
+                println!(
+                    "[DEBUG min global] Final global reduction shape: {:?}",
+                    Self::shape(&result)
+                );
+
+                Ok(result)
+            }
+        }
+    }
+
+    fn argmax(_x: &Self::Storage, axis: usize) -> Result<Self::Storage, Error> {
+        Err(Error::InvalidOperation(format!(
+            "CUDA argmax not implemented yet (axis: {})",
+            axis
+        )))
+    }
+
+    fn argmin(_x: &Self::Storage, axis: usize) -> Result<Self::Storage, Error> {
+        Err(Error::InvalidOperation(format!(
+            "CUDA argmin not implemented yet (axis: {})",
+            axis
+        )))
+    }
+
+    fn max_backward(
+        op: &crate::graph::Op<Self>,
+        grad_output: &Self::Storage,
+    ) -> Result<Self::Storage, Error> {
+        println!("[DEBUG max_backward] Attempting to get global context...");
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("max_backward_kernel")
+            .ok_or_else(|| Error::CudaError("max_backward_kernel not found".to_string()))?;
+
+        // Extract necessary tensors and shapes
+        if op.inputs.len() != 1 {
+            return Err(Error::InvalidOperation(format!(
+                "Max backward expects 1 input, got {}",
+                op.inputs.len()
+            )));
+        }
+
+        // Get the input tensor and forward output
+        let input = &op.inputs[0];
+        let input_data_ref = input.data();
+        let input_data = &*input_data_ref;
+        
+        // Determine if this is a global max or axis-specific max
+        let axis = match &op.op_type {
+            OpType::Max(axis) => *axis,
+            _ => return Err(Error::InternalLogicError("Expected Max operation type".to_string())),
+        };
+        
+        // Compute the max operation result again
+        let forward_output = Self::max(input_data, axis)?;
+
+        // Create a gradient tensor with the same shape as the input
+        let mut grad_input = CudaStorage::new(Self::shape(input_data))?;
+        
+        // Get additional information needed for the kernel
+        let n = Self::size(input_data);
+        let stream = ctx.get_stream();
+        let block_size = 256;
+        let grid_size = (n + block_size - 1) / block_size;
+
+        // Launch the kernel to compute the max backward
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                input_data.as_ptr(),
+                forward_output.as_ptr(),
+                grad_output.as_ptr(),
+                grad_input.as_mut_ptr(),
+                n as i32
+            ))?;
+        }
+        stream.synchronize()?;
+        
+        // Return the computed gradient
+        Ok(grad_input)
+    }
+
+    fn elu_backward(
+        op: &crate::graph::Op<Self>,
+        output_grad: &Self::Storage,
+    ) -> Result<Self::Storage, Error> {
+        // Validate input
+        if op.inputs.len() != 1 {
+            return Err(Error::InvalidOperation(
+                "ELU backward expects 1 input".to_string(),
+            ));
+        }
+
+        // Extract alpha from the OpType
+        let alpha = match op.op_type {
+            OpType::Elu(a) => a,
+            _ => return Err(Error::InternalLogicError("Incorrect OpType for ELU backward".to_string())),
+        };
+
+        let input_data_ref = op.inputs[0].data();
+        let input_data = &*input_data_ref;
+        let n = input_data.len();
+        if n == 0 {
+            return CudaStorage::new(input_data.shape());
+        }
+        let mut grad_input = CudaStorage::new(input_data.shape())?;
+
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("elu_backward_kernel")
+            .ok_or_else(|| Error::CudaError("elu_backward_kernel not found".to_string()))?;
+        let stream = ctx.get_stream();
+        let block_size = 256;
+        let grid_size = n.div_ceil(block_size);
+
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                input_data.as_ptr(),
+                output_grad.as_ptr(),
+                grad_input.as_mut_ptr(),
+                alpha,
+                n as i32
+            ))
+            .map_err(|e| Error::CudaError(format!("elu_backward kernel launch failed: {}", e)))?;
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::CudaError(format!("Stream sync failed after elu_backward: {}", e)))?;
+        Ok(grad_input)
+    }
+
+    // Add the missing helper functions
+
+    /// Compute the output shape for a reduction operation
+    fn compute_reduction_shape(input_shape: &[usize], axis: Option<usize>) -> Result<Vec<usize>, Error> {
+        match axis {
+            None => {
+                Ok(vec![]) // Global reduction results in scalar []
+            }
+            Some(axis_val) => {
+                if input_shape.is_empty() { // Handle 0D input
+                    if axis_val == 0 { return Ok(vec![]); } // Reducing axis 0 of 0D gives 0D
+                    else { return Err(Error::InvalidIndex(vec![axis_val])); }
+                }
+                if axis_val >= input_shape.len() {
+                    return Err(Error::InvalidIndex(vec![axis_val]));
+                }
+                let mut output_shape = input_shape.to_vec();
+                output_shape.remove(axis_val);
+                // If the resulting shape is empty (e.g., reduced a 1D array), return []
+                if output_shape.is_empty() && input_shape.len() == 1 {
+                    Ok(vec![])
+                } else {
+                    Ok(output_shape)
+                }
+            }
+        }
+    }
+
+    // Convert any DeviceCopy type to a device buffer
+    fn to_device_buffer_generic<T: cust::memory::DeviceCopy>(data: &[T]) -> Result<DeviceBuffer<T>, Error> {
+        if data.is_empty() {
+            // Handle empty slice case appropriately
+            println!("[WARN] to_device_buffer_generic called with empty slice. Allocating buffer of size 1.");
+            let buffer = unsafe { DeviceBuffer::<T>::uninitialized(1)? };
+            Ok(buffer)
+        } else {
+            DeviceBuffer::from_slice(data).map_err(|e| Error::CudaError(e.to_string()))
+        }
+    }
+
+    fn prod(x: &Self::Storage, axis: Option<usize>) -> Result<Self::Storage, Error> {
+        // Use CPU fallback for this operation since it's less performance-critical
+        // Convert CUDA tensor to CPU
+        let cpu_x = Self::copy_to_host(x)?;
+        let cpu_shape = Self::shape(x).to_vec();
+        
+        // Create a CpuStorage with the same shape
+        let cpu_tensor = CpuBackend::from_vec(cpu_x, &cpu_shape)?;
+        
+        // Perform operation on CPU
+        let cpu_result = CpuBackend::prod(&cpu_tensor, axis)?;
+        
+        // Get the result as a vector and its shape
+        let cpu_result_vec = CpuBackend::into_raw_vec(cpu_result.clone())?;
+        let cpu_result_shape = CpuBackend::shape(&cpu_result).to_vec();
+        
+        // Convert back to CUDA
+        let cuda_result = Self::from_vec(cpu_result_vec, &cpu_result_shape)?;
+        
+        Ok(cuda_result)
+    }
+
+    fn min_backward(
+        op: &crate::graph::Op<Self>,
+        grad_output: &Self::Storage,
+    ) -> Result<Self::Storage, Error> {
+        println!("[DEBUG min_backward] Attempting to get global context...");
+        let ctx = get_global_context()?;
+        let kernel = ctx
+            .get_kernel("min_backward_kernel")
+            .ok_or_else(|| Error::CudaError("min_backward_kernel not found".to_string()))?;
+
+        // Extract necessary tensors and shapes
+        if op.inputs.len() != 1 {
+            return Err(Error::InvalidOperation(format!(
+                "Min backward expects 1 input, got {}",
+                op.inputs.len()
+            )));
+        }
+
+        // Get the input tensor and forward output
+        let input = &op.inputs[0];
+        let input_data_ref = input.data();
+        let input_data = &*input_data_ref;
+        
+        // Determine if this is a global min or axis-specific min
+        let axis = match &op.op_type {
+            OpType::Min(axis) => *axis,
+            _ => return Err(Error::InternalLogicError("Expected Min operation type".to_string())),
+        };
+        
+        // Compute the min operation result again
+        let forward_output = Self::min(input_data, axis)?;
+
+        // Create a gradient tensor with the same shape as the input
+        let mut grad_input = CudaStorage::new(Self::shape(input_data))?;
+        
+        // Get additional information needed for the kernel
+        let n = Self::size(input_data);
+        let stream = ctx.get_stream();
+        let block_size = 256;
+        let grid_size = (n + block_size - 1) / block_size;
+
+        // Launch the kernel to compute the min backward
+        unsafe {
+            launch!(kernel<<<grid_size as u32, block_size as u32, 0, stream>>>(
+                input_data.as_ptr(),
+                forward_output.as_ptr(),
+                grad_output.as_ptr(),
+                grad_input.as_mut_ptr(),
+                n as i32
+            ))?;
+        }
+        stream.synchronize()?;
+        
+        // Return the computed gradient
+        Ok(grad_input)
+    }
+
+    fn prod_backward(
+        op: &crate::graph::Op<Self>,
+        grad_output: &Self::Storage,
+    ) -> Result<Self::Storage, Error> {
+        // Use CPU fallback for this operation
+        // Extract data from op
+        if op.inputs.len() != 1 {
+            return Err(Error::InvalidOperation(
+                "Prod backward expects 1 input".to_string(),
+            ));
+        }
+
+        // Get input data and convert to CPU
+        let input = &op.inputs[0];
+        let input_data_ref = input.data();
+        let input_data = &*input_data_ref;
+        
+        let cpu_input = Self::copy_to_host(input_data)?;
+        let cpu_input_shape = Self::shape(input_data).to_vec();
+        let cpu_input_tensor = CpuBackend::from_vec(cpu_input, &cpu_input_shape)?;
+        
+        // Get output grad and convert to CPU
+        let cpu_grad_output = Self::copy_to_host(grad_output)?;
+        let cpu_grad_output_shape = Self::shape(grad_output).to_vec();
+        let cpu_grad_output_tensor = CpuBackend::from_vec(cpu_grad_output, &cpu_grad_output_shape)?;
+        
+        // Create a CPU version of the op - use a Vec<Tensor> for inputs
+        let cpu_input_tensor_vec = vec![cpu_input_tensor];
+        
+        let cpu_op = crate::graph::Op::new(
+            op.op_type.clone(),
+            cpu_input_tensor_vec,
+            |_, _| unreachable!(), // Backward function not needed for this conversion
+        );
+        
+        // Perform the operation on CPU
+        let cpu_result = CpuBackend::prod_backward(&cpu_op, &cpu_grad_output_tensor)?;
+        
+        // Get the result as a vector and its shape
+        let cpu_result_vec = CpuBackend::into_raw_vec(cpu_result)?;
+        let cpu_result_shape = CpuBackend::shape(&cpu_result).to_vec();
+        
+        // Convert back to CUDA
+        let cuda_result = Self::from_vec(cpu_result_vec, &cpu_result_shape)?;
+        
+        Ok(cuda_result)
+    }
+} // Close the impl Backend for CudaBackend block

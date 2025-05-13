@@ -1,0 +1,52 @@
+# Rust build artifacts and dependencies
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Debug files
+*.pdb
+
+# System-specific files
+.DS_Store
+.env
+.git/
+
+# Generated documentation
+/doc/
+/target/doc/
+/internal-doc/
+
+# Test coverage
+/coverage/
+/target/coverage/
+
+# Backup files
+*~
+*.bak
+
+# Dataset files 
+# JSON files
+cuda_tensor.json
+# Download here: https://pjreddie.com/media/files/mnist_train.csv
+# Download here: https://pjreddie.com/media/files/mnist_test.csv
+# Note: these files are not included in the repository due to the size
+data/mnist_train.csv
+data/mnist_test.csv
+data/mnist_test.csv:Zone.Identifier
+data/mnist_train.csv:Zone.Identifier
+
+# Profile and debug files
+*.nsys-rep
+*.sqlite
+*.log
+profile_results_*.txt
+
+# Additional directories
+/data/
+/internal-doc/
