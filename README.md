@@ -433,3 +433,8 @@ This project aims to be a welcoming community. Please review and adhere to our [
 Copyright (c) 2025 Ramsyana <ramsyana@mac.com>
 
 This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
+
+## Support My Work
+
+[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/ramsy)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%23FFDD00?style=flat-square&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ramsy)
