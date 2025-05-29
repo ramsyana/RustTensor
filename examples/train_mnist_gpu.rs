@@ -15,10 +15,11 @@ use rust_tensor_lib::backend::cuda::init_context;
 use std::time::Instant;
 
 // --- Constants ---
-const BATCH_SIZE: usize = 64;
-const NUM_EPOCHS: usize = 3;
-const LEARNING_RATE: f32 = 0.01;
-const HIDDEN_SIZE: usize = 128;
+const BATCH_SIZE: usize = 128;
+const NUM_EPOCHS: usize = 20;
+const LEARNING_RATE: f32 = 0.005;
+const HIDDEN_SIZE: usize = 256;
+const HIDDEN_SIZE2: usize = 128;
 const INPUT_SIZE: usize = 784; // 28x28 pixels
 const NUM_CLASSES: usize = 10;
 const MNIST_TRAIN_PATH: &str = "data/mnist_train.csv";
@@ -26,38 +27,46 @@ const MNIST_TEST_PATH: &str = "data/mnist_test.csv";
 
 // --- Model Definition (Simple MLP) ---
 // Model is generic over the Backend
+// --- MLP with two hidden layers ---
 struct MlpModel<B: Backend> {
-    w1: Tensor<B>,
-    w2: Tensor<B>,
+    w1: Tensor<B>, // [input_size, hidden_size]
+    w2: Tensor<B>, // [hidden_size, hidden_size2]
+    w3: Tensor<B>, // [hidden_size2, num_classes]
     // Add biases later if needed
     // b1: Tensor<B>,
     // b2: Tensor<B>,
+    // b3: Tensor<B>,
 }
 
 impl<B: Backend> MlpModel<B> {
     /// Creates a new MLP model with Kaiming initialized weights.
-    fn new(input_size: usize, hidden_size: usize, num_classes: usize) -> Result<Self, Error> {
-        // Use generic Tensor factory method
+    fn new(input_size: usize, hidden_size: usize, hidden_size2: usize, num_classes: usize) -> Result<Self, Error> {
+        // Two hidden layers
         let w1 = Tensor::<B>::kaiming_uniform(input_size, &[input_size, hidden_size], true)?;
-        let w2 = Tensor::<B>::kaiming_uniform(hidden_size, &[hidden_size, num_classes], true)?;
-        Ok(Self { w1, w2 })
+        let w2 = Tensor::<B>::kaiming_uniform(hidden_size, &[hidden_size, hidden_size2], true)?;
+        let w3 = Tensor::<B>::kaiming_uniform(hidden_size2, &[hidden_size2, num_classes], true)?;
+        Ok(Self { w1, w2, w3 })
     }
 
     /// Performs a forward pass through the model using generic ops.
     fn forward(&self, x: &Tensor<B>) -> Result<Tensor<B>, Error> {
         debug_println!("forward: x shape = {:?}", x.shape());
-        let h = ops::matmul(x, &self.w1)?;
-        debug_println!("forward: h shape = {:?}", h.shape());
-        let h_relu = ops::relu(&h)?;
-        debug_println!("forward: h_relu shape = {:?}", h_relu.shape());
-        let logits = ops::matmul(&h_relu, &self.w2)?;
+        let h1 = ops::matmul(x, &self.w1)?;
+        debug_println!("forward: h1 shape = {:?}", h1.shape());
+        let h1_relu = ops::relu(&h1)?;
+        debug_println!("forward: h1_relu shape = {:?}", h1_relu.shape());
+        let h2 = ops::matmul(&h1_relu, &self.w2)?;
+        debug_println!("forward: h2 shape = {:?}", h2.shape());
+        let h2_relu = ops::relu(&h2)?;
+        debug_println!("forward: h2_relu shape = {:?}", h2_relu.shape());
+        let logits = ops::matmul(&h2_relu, &self.w3)?;
         debug_println!("forward: logits shape = {:?}", logits.shape());
         Ok(logits)
     }
 
     /// Returns a list of trainable parameters (cloned Tensors).
     fn parameters(&self) -> Vec<Tensor<B>> {
-        vec![self.w1.clone(), self.w2.clone()]
+        vec![self.w1.clone(), self.w2.clone(), self.w3.clone()]
     }
 }
 
@@ -264,7 +273,7 @@ fn main() -> Result<(), Error> {
     );
 
     // --- Initialize Model ---
-    let model = MlpModel::<ActiveBackend>::new(INPUT_SIZE, HIDDEN_SIZE, NUM_CLASSES)?;
+    let model = MlpModel::<ActiveBackend>::new(INPUT_SIZE, HIDDEN_SIZE, HIDDEN_SIZE2, NUM_CLASSES)?;
 
     // --- Setup Optimizer ---
     let mut optimizer = Sgd::new(model.parameters(), LEARNING_RATE);
@@ -275,7 +284,7 @@ fn main() -> Result<(), Error> {
 
     for epoch in 0..NUM_EPOCHS {
         let mut epoch_loss = 0.0;
-        let mut num_batches = 0;
+
 
         // Get number of samples
         let num_samples = x_train.shape()[0];
@@ -284,14 +293,22 @@ fn main() -> Result<(), Error> {
             break;
         }
 
-        // Process training set in batches
-        for i in (0..num_samples).step_by(BATCH_SIZE) {
-            let current_batch_size = std::cmp::min(BATCH_SIZE, num_samples - i);
+        // Process training set in mini-batches using tensor chunking
+        let num_batches = (num_samples + BATCH_SIZE - 1) / BATCH_SIZE;
+        for batch_idx in 0..num_batches {
+            let start = batch_idx * BATCH_SIZE;
+            let end = std::cmp::min(start + BATCH_SIZE, num_samples);
+            let current_batch_size = end - start;
             if current_batch_size == 0 {
                 continue;
             }
 
-            // Get batch
+            // Use tensor slicing to get the batch if available, otherwise fallback to get_random_batch
+            // Example using index_select (pseudo-code):
+            // let indices: Vec<usize> = (start..end).collect();
+            // let bx = x_train.index_select(0, &indices)?;
+            // let by = y_train.index_select(0, &indices)?;
+            // If index_select is not available, fallback:
             let (bx, by) = get_random_batch(&x_train, &y_train, current_batch_size)?;
 
             // --- Forward pass ---
@@ -304,7 +321,6 @@ fn main() -> Result<(), Error> {
             let loss_data = CpuBackend::copy_to_host(&*loss_cpu.data())?;
             let loss_value = loss_data[0];
             epoch_loss += loss_value;
-            num_batches += 1;
 
             // --- Backward pass ---
             optimizer.zero_grad()?;
@@ -312,13 +328,13 @@ fn main() -> Result<(), Error> {
             optimizer.step()?;
 
             // Print progress
-            if i % (BATCH_SIZE * 100) == 0 {
+            if batch_idx % 100 == 0 {
                 println!(
                     "Epoch: {}/{}, Batch: {}/{}, Loss: {:.4}",
                     epoch + 1,
                     NUM_EPOCHS,
-                    i / BATCH_SIZE,
-                    (num_samples + BATCH_SIZE - 1) / BATCH_SIZE,
+                    batch_idx,
+                    num_batches,
                     loss_value
                 );
             }
