@@ -6,6 +6,12 @@
 // Define debug print macros based on feature flag
 // When debug_logs feature is enabled, use println!, otherwise use a no-op macro
 #[cfg(feature = "debug_logs")]
+macro_rules! debug_println {
+    ($($arg:tt)*) => {
+        println!($($arg)*);
+    };
+}
+
 #[cfg(not(feature = "debug_logs"))]
 macro_rules! debug_println {
     ($($arg:tt)*) => {};
