@@ -190,7 +190,7 @@ fn sample<B: Backend>(
     let mut curr_char_ix = seed_char;
     let mut curr_h = h.clone();
     let mut curr_c = c.clone();
-    let mut rng = ThreadRng::default();
+    let mut rng = rand::thread_rng();
     for _ in 0..length {
         // Create one-hot encoding for current character
         let mut x_data = vec![0.0; vocab_size];
@@ -208,7 +208,7 @@ fn sample<B: Backend>(
         let probs = ops::exp(&log_probs)?;
         // Multinomial sampling
         let mut next_char_ix = 0;
-        let r: f32 = rng.random_range(0.0..1.0);
+        let r: f32 = rng.gen_range(0.0..1.0);
         let mut cumsum = 0.0;
         let shape = probs.shape();
         let size = shape.iter().product::<usize>();
@@ -297,7 +297,7 @@ fn generate_text<B: Backend>(
         
         // Option 2: Probabilistic sampling
         let mut next_ix_val = 0;
-        let mut rng = ThreadRng::default();
+        let mut rng = rand::thread_rng();
         let r: f32 = rng.random_range(0.0..1.0);
         let mut cumsum = 0.0;
         
@@ -477,8 +477,8 @@ fn main() -> Result<(), Error> {
         // Generate sample text every 10 epochs or at the end
         if (epoch + 1) % 10 == 0 || epoch == NUM_EPOCHS - 1 {
             // Use a random seed character
-            let mut rng = ThreadRng::default();
-            let seed_idx = data_ix[rng.random_range(0..data_ix.len())];
+            let mut rng = rand::thread_rng();
+            let seed_idx = data_ix[rng.gen_range(0..data_ix.len())];
             
             // Initialize h and c for sampling
             let h0 = Tensor::<CpuBackend>::zeros(&[1, HIDDEN_SIZE], false)?;
