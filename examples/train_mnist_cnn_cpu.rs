@@ -86,30 +86,31 @@ fn main() -> Result<(), Error> {
     // For simplicity, we'll create a new smaller dataset with just the first 1000 samples
     let subset_size = 1000;
     
+    // Calculate sample sizes
+    let x_sample_size = x_train.shape()[1] * x_train.shape()[2] * x_train.shape()[3]; // 1*28*28 = 784
+    let y_sample_size = y_train.shape()[1]; // usually 10 for one-hot labels
+
     // Create new tensors with the first subset_size samples
-    let mut x_train_data = Vec::with_capacity(subset_size * x_train.shape()[1]);
-    let mut y_train_data = Vec::with_capacity(subset_size * y_train.shape()[1]);
+    let mut x_train_data = Vec::with_capacity(subset_size * x_sample_size);
+    let mut y_train_data = Vec::with_capacity(subset_size * y_sample_size);
     
     // Copy the first subset_size samples
     for i in 0..subset_size {
         if i >= x_train.shape()[0] {
             break;
         }
-        
         // Get a reference to the data for this iteration
         let x_data_ref = x_train.data();
         let y_data_ref = y_train.data();
         let x_cpu = x_data_ref.as_ref();
         let y_cpu = y_data_ref.as_ref();
-        
         // Copy x data
-        let start_x = i * x_train.shape()[1];
-        let end_x = start_x + x_train.shape()[1];
+        let start_x = i * x_sample_size;
+        let end_x = start_x + x_sample_size;
         x_train_data.extend_from_slice(&x_cpu[start_x..end_x]);
-        
         // Copy y data
-        let start_y = i * y_train.shape()[1];
-        let end_y = start_y + y_train.shape()[1];
+        let start_y = i * y_sample_size;
+        let end_y = start_y + y_sample_size;
         y_train_data.extend_from_slice(&y_cpu[start_y..end_y]);
     }
     
@@ -139,28 +140,30 @@ fn main() -> Result<(), Error> {
         let start_time = Instant::now();
         let mut train_loss = 0.0;
         let mut num_batches = 0;
-        
-        // For each epoch, we'll use the entire subset
-        let batch_x = x_train_subset.clone();
-        let batch_y = y_train_subset.clone();
-        
-        optimizer.zero_grad()?;
-        
-        let logits = model.forward(&batch_x)?;
-        let loss = ops::softmax_cross_entropy(&logits, &batch_y, 1, Reduction::Mean)?;
 
-        loss.backward()?;
-        optimizer.step()?;
+        let num_samples = x_train_subset.shape()[0];
+        let mut batch_start = 0;
+        while batch_start < num_samples {
+            let batch_end = usize::min(batch_start + BATCH_SIZE, num_samples);
+            // Slice the batch
+            let batch_x = x_train_subset.slice(&[batch_start..batch_end])?;
+            let batch_y = y_train_subset.slice(&[batch_start..batch_end])?;
 
-        train_loss += loss.to_cpu()?.data().as_ref()[0];
-        num_batches += 1;
-        
+            optimizer.zero_grad()?;
+            let logits = model.forward(&batch_x)?;
+            let loss = ops::softmax_cross_entropy(&logits, &batch_y, 1, Reduction::Mean)?;
+            loss.backward()?;
+            optimizer.step()?;
+
+            train_loss += loss.to_cpu()?.data().as_ref()[0];
+            num_batches += 1;
+            batch_start = batch_end;
+        }
+
         let avg_loss = train_loss / num_batches as f32;
         let elapsed = start_time.elapsed();
-        
         // Evaluate on test set
         let test_acc = evaluate_cnn(&model, &x_test, &y_test, BATCH_SIZE)?;
-        
         println!(
             "Epoch {} | Loss: {:.4} | Test Acc: {:.2}% | Time: {:.2}s",
             epoch + 1,
