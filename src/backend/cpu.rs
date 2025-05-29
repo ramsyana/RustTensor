@@ -8,8 +8,9 @@ use crate::init; // For kaiming_uniform implementation delegation
 use crate::ops::cpu_backward;
 use crate::ops::cpu_ops; // Import the module itself
                                          // Random imports for random_uniform
-use rand::Rng;
+// Random number generation is handled through Distribution trait
 use rand_distr::{Bernoulli, Normal, Uniform};
+use rand_distr::Distribution;
 // Remove unused ndarray imports if Array handles everything
 // use ndarray::{ArrayD, Axis, Dimension, IxDyn}; // Import ArrayD, Axis, Dimension and IxDyn for argmax/argmin implementation
 use std::fmt::{self, Debug, Display}; // Import formatting traits
@@ -140,7 +141,7 @@ impl Backend for CpuBackend {
         let mut rng = rand::rng();
         let mut data = Vec::with_capacity(size);
         for _ in 0..size {
-            data.push(rng.sample(dist));
+            data.push(Distribution::sample(&dist, &mut rng));
         }
         Array::from_vec(data, shape)
     }
@@ -156,7 +157,7 @@ impl Backend for CpuBackend {
         let mut rng = rand::rng();
         let mut data = Vec::with_capacity(size);
         for _ in 0..size {
-            data.push(rng.sample(dist));
+            data.push(Distribution::sample(&dist, &mut rng));
         }
 
         Array::from_vec(data, shape)
@@ -173,8 +174,8 @@ impl Backend for CpuBackend {
         let mut rng = rand::rng();
         let mut data = Vec::with_capacity(size);
         for _ in 0..size {
-            let sample: bool = rng.sample(dist);
-            data.push(if sample { 1.0f32 } else { 0.0f32 });
+            let sample: bool = Distribution::sample(&dist, &mut rng);
+            data.push(if sample { 1.0 } else { 0.0 });
         }
 
         Array::from_vec(data, shape)
@@ -1602,10 +1603,11 @@ impl Backend for CpuBackend {
         // For division a/b:
         // da = dout * (1/b)
         // db = dout * (-a/b^2)
-        let ones = &Self::ones(b.shape())?;
-        let reciprocal_b = Self::div(ones, b)?;
+        let ones = Self::ones(b.shape())?;
+        let reciprocal_b = Self::div(&ones, b)?;
         let b_squared = Self::mul(b, b)?;
-        let neg_a_over_b_squared = Self::div_scalar(&Self::div(a, &b_squared)?, -1.0)?;
+        let a_over_b_squared = Self::div(a, &b_squared)?;
+        let neg_a_over_b_squared = Self::div_scalar(&a_over_b_squared, -1.0)?;
 
         // Calculate gradients
         let grad_a = Self::mul(output_grad, &reciprocal_b)?;
