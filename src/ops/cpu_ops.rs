@@ -141,7 +141,9 @@ pub fn conv2d(
         }
     }
     // Reshape weights to [C_out, C_in * K_h * K_w]
-    let weights_2d = weights.get_data().clone().into_shape_with_order((c_out, c_in * k_h * k_w)).unwrap();
+    let weights_2d = weights.get_data().clone()
+        .into_shape_with_order((c_out, c_in * k_h * k_w))
+        .map_err(|e| Error::ShapeError(format!("conv2d: {}", e)))?;
     // Output: [N, C_out, H_out * W_out]
     let mut out = ndarray::Array3::<f32>::zeros((n, c_out, h_out * w_out));
     for b in 0..n {
@@ -247,7 +249,8 @@ pub fn conv2d_backward(
         let grad_out = grad_out_3d.slice(s![b, .., ..]);
         grad_w = &grad_w + &grad_out.dot(&col.t());
     }
-    let grad_w = grad_w.into_shape_with_order((c_out, c_in, k_h, k_w)).unwrap();
+    let grad_w = grad_w.into_shape_with_order((c_out, c_in, k_h, k_w))
+        .map_err(|e| Error::ShapeError(format!("conv2d_backward: {}", e)))?;
     // db: [C_out]
     let mut grad_b = ndarray::Array1::<f32>::zeros(c_out);
     for b in 0..n {
@@ -263,7 +266,7 @@ pub fn conv2d_backward(
         let _grad_out_t = grad_out.t(); // [H_out*W_out, C_out]
         let grad_cols = weights_2d.t().dot(&grad_out);
         // col2im
-        let col_idx = 0;
+        let mut col_idx = 0;
         for y in 0..h_out {
             for x in 0..w_out {
                 let y_start = y as isize * stride_h as isize - pad_h as isize;
@@ -282,6 +285,7 @@ pub fn conv2d_backward(
                         }
                     }
                 }
+                col_idx += 1;
             }
         }
     }
