@@ -18,6 +18,7 @@ struct SendSyncRawHandle(cublas_sys::cublasHandle_t);
 unsafe impl Send for SendSyncRawHandle {}
 unsafe impl Sync for SendSyncRawHandle {}
 
+// Use a simpler approach without explicit lifetimes
 pub struct CudaContext {
     pub(crate) _context: Context,
     #[allow(dead_code)]
@@ -25,7 +26,8 @@ pub struct CudaContext {
     stream: Stream,
     cublas_handle: SendSyncRawHandle,
     modules: HashMap<String, Arc<Module>>,
-    kernels: HashMap<String, Function<'static>>,
+    // Store functions with their module references
+    kernels: HashMap<String, (Arc<Module>, String)>, // Store kernel name instead of Function
 }
 
 lazy_static! {
@@ -34,6 +36,54 @@ lazy_static! {
 }
 
 impl CudaContext {
+    // Helper function to find the directory containing PTX files
+    fn find_ptx_directory() -> Result<std::path::PathBuf, Error> {
+        // Try to find PTX files in several locations
+        
+        // 1. First check if OUT_DIR is available (during cargo build/test)
+        if let Ok(out_dir) = std::env::var("OUT_DIR") {
+            let path = Path::new(&out_dir);
+            if path.join("elementwise.ptx").exists() {
+                return Ok(path.to_path_buf());
+            }
+        }
+        
+        // 2. Check relative to executable path
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                // Try in the same directory as the executable
+                let path = exe_dir.to_path_buf();
+                if path.join("elementwise.ptx").exists() {
+                    return Ok(path);
+                }
+                
+                // Try in a 'ptx' subdirectory
+                let ptx_subdir = exe_dir.join("ptx");
+                if ptx_subdir.join("elementwise.ptx").exists() {
+                    return Ok(ptx_subdir);
+                }
+            }
+        }
+        
+        // 3. Check relative to current directory
+        let current_dir = std::env::current_dir()?;
+        let path = current_dir.to_path_buf();
+        if path.join("elementwise.ptx").exists() {
+            return Ok(path);
+        }
+        
+        // 4. Try a 'ptx' subdirectory of current directory
+        let ptx_subdir = current_dir.join("ptx");
+        if ptx_subdir.join("elementwise.ptx").exists() {
+            return Ok(ptx_subdir);
+        }
+        
+        // If we get here, we couldn't find the PTX files
+        Err(Error::CudaError(
+            "Could not find PTX files. Make sure they are in the executable directory, \
+             current directory, or set OUT_DIR environment variable.".into(),
+        ))
+    }
     fn new(device_id: u32) -> Result<Self, Error> {
         cust::init(cust::CudaFlags::empty())?;
         let device = Device::get_device(device_id).map_err(|e| Error::CudaError(e.to_string()))?;
@@ -49,6 +99,13 @@ impl CudaContext {
                 return Err(Error::CudaError(
                     "Failed to create cuBLAS handle".to_string(),
                 ));
+            }
+            
+            // Bind handle to the dedicated stream
+            // Use the raw pointer directly
+            let status = cublas_sys::cublasSetStream_v2(handle, stream.as_inner() as _);
+            if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(Error::CudaError("Failed to set cuBLAS stream".into()));
             }
         }
 
@@ -184,11 +241,10 @@ impl CudaContext {
                 kernel_name
             );
             match arc_module.get_function(kernel_name) {
-                Ok(func) => {
+                Ok(_) => {
                     debug_println!("Successfully loaded kernel: {}", kernel_name);
-                    let static_func =
-                        unsafe { std::mem::transmute::<Function<'_>, Function<'static>>(func) };
-                    functions_to_add.insert(kernel_name.to_string(), static_func);
+                    // Store the kernel name instead of the function object
+                    functions_to_add.insert(kernel_name.to_string(), (arc_module.clone(), kernel_name.to_string()));
                 }
                 Err(e) => {
                     return Err(Error::CudaError(format!(
@@ -206,16 +262,19 @@ impl CudaContext {
     }
 
     fn load_kernels(&mut self) -> Result<(), Error> {
-        let out_dir = std::env::var("OUT_DIR")
-            .map_err(|_| Error::InternalLogicError("OUT_DIR not set".to_string()))?;
-        let elementwise_ptx_path = Path::new(&out_dir).join("elementwise.ptx");
-        let reduction_ptx_path = Path::new(&out_dir).join("reduction.ptx");
-        let optimizer_ptx_path = Path::new(&out_dir).join("optimizer.ptx");
-        let transpose_ptx_path = Path::new(&out_dir).join("transpose.ptx");
-        let log_softmax_fused_ptx_path = Path::new(&out_dir).join("log_softmax_fused.ptx");
-        let conv_ptx_path = Path::new(&out_dir).join("conv.ptx");
-        let pooling_ptx_path = Path::new(&out_dir).join("pooling.ptx");
-        let array_ops_ptx_path = Path::new(&out_dir).join("array_ops.ptx");
+        // Use a more robust approach to locate PTX files
+        // First try executable directory, then current directory, then OUT_DIR
+        let ptx_dir = Self::find_ptx_directory()?;
+        debug_println!("Using PTX directory: {}", ptx_dir.display());
+        
+        let elementwise_ptx_path = ptx_dir.join("elementwise.ptx");
+        let reduction_ptx_path = ptx_dir.join("reduction.ptx");
+        let optimizer_ptx_path = ptx_dir.join("optimizer.ptx");
+        let transpose_ptx_path = ptx_dir.join("transpose.ptx");
+        let log_softmax_fused_ptx_path = ptx_dir.join("log_softmax_fused.ptx");
+        let conv_ptx_path = ptx_dir.join("conv.ptx");
+        let pooling_ptx_path = ptx_dir.join("pooling.ptx");
+        let array_ops_ptx_path = ptx_dir.join("array_ops.ptx");
 
         self.load_kernel_module("elementwise", &elementwise_ptx_path)?;
         self.load_kernel_module("reduction", &reduction_ptx_path)?;
@@ -236,8 +295,10 @@ impl CudaContext {
         self.cublas_handle.0
     }
 
-    pub fn get_kernel(&self, name: &str) -> Option<&Function<'static>> {
-        self.kernels.get(name)
+    pub fn get_kernel(&self, name: &str) -> Option<Function> {
+        self.kernels.get(name).and_then(|(module, kernel_name)| {
+            module.get_function(kernel_name).ok()
+        })
     }
 }
 
