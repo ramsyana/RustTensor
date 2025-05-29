@@ -234,11 +234,18 @@ impl Backend for CpuBackend {
                 actual: vec![data.len()],
             });
         }
-        storage
-            .get_data_mut()
-            .as_slice_mut()
-            .unwrap()
-            .copy_from_slice(data);
+        if let Some(slice) = storage.get_data_mut().as_slice_mut() {
+            slice.copy_from_slice(data);
+        } else {
+            // Fallback – element-wise copy for non-contiguous layout.
+            // Use manual indexing since Zip has dimension compatibility issues
+            let mut data_iter = data.iter();
+            for dst in storage.get_data_mut().iter_mut() {
+                if let Some(&src) = data_iter.next() {
+                    *dst = src;
+                }
+            }
+        }
         Ok(())
     }
 
