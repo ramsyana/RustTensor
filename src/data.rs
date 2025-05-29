@@ -158,7 +158,7 @@ where
     }
 
     // Get random indices directly using sampling without replacement
-    let mut rng = rand::rng(); // Use rand::rng() as recommended
+    let mut rng = rand::rng(); // Use rand::rng() as it's the correct function name
     let batch_indices = index::sample(&mut rng, num_samples, batch_size).into_vec();
 
     // Determine feature dimensions
