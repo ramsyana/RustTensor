@@ -228,12 +228,14 @@ extern "C" {
     __device__ inline void flat_index_to_multi_dim(int flat_index, const int* shape, int ndim, int* coords) {
         int current_index = flat_index;
         for (int i = ndim - 1; i >= 0; --i) {
-            if (shape[i] > 0) { // Avoid division by zero for empty dimensions
-                coords[i] = current_index % shape[i];
-                current_index /= shape[i];
-            } else {
+            const int dim = shape[i];
+            if (dim == 0) {
                 coords[i] = 0;
+                current_index = 0;           // prevent stale remainder
+                continue;
             }
+            coords[i] = current_index % dim;
+            current_index /= dim;
         }
     }
 
