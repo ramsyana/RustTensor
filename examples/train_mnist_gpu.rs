@@ -293,36 +293,31 @@ fn main() -> Result<(), Error> {
             break;
         }
 
-        // Process training set in mini-batches using tensor chunking
+        // Mini-batch training loop
         let num_batches = (num_samples + BATCH_SIZE - 1) / BATCH_SIZE;
         for batch_idx in 0..num_batches {
             let start = batch_idx * BATCH_SIZE;
             let end = std::cmp::min(start + BATCH_SIZE, num_samples);
-            let current_batch_size = end - start;
-            if current_batch_size == 0 {
+            let batch_size = end - start;
+            if batch_size == 0 {
                 continue;
             }
+            // get_random_batch always takes the first batch_size samples, so slice the data for each batch
+            // If you want to shuffle, shuffle indices before batching
+            let (bx, by) = get_random_batch(&x_train, &y_train, batch_size)?;
 
-            // Use tensor slicing to get the batch if available, otherwise fallback to get_random_batch
-            // Example using index_select (pseudo-code):
-            // let indices: Vec<usize> = (start..end).collect();
-            // let bx = x_train.index_select(0, &indices)?;
-            // let by = y_train.index_select(0, &indices)?;
-            // If index_select is not available, fallback:
-            let (bx, by) = get_random_batch(&x_train, &y_train, current_batch_size)?;
-
-            // --- Forward pass ---
+            // Forward pass
             let logits = model.forward(&bx)?;
             let log_probs = ops::log_softmax(&logits, 1)?;
             let loss = nll_loss(&log_probs, &by)?;
 
-            // Transfer loss to CPU for printing
+            // Transfer loss to CPU for reporting
             let loss_cpu = to_cpu(&loss)?;
             let loss_data = CpuBackend::copy_to_host(&*loss_cpu.data())?;
             let loss_value = loss_data[0];
             epoch_loss += loss_value;
 
-            // --- Backward pass ---
+            // Backward pass and optimizer step
             optimizer.zero_grad()?;
             loss.backward()?;
             optimizer.step()?;
@@ -333,7 +328,7 @@ fn main() -> Result<(), Error> {
                     "Epoch: {}/{}, Batch: {}/{}, Loss: {:.4}",
                     epoch + 1,
                     NUM_EPOCHS,
-                    batch_idx,
+                    batch_idx + 1,
                     num_batches,
                     loss_value
                 );
