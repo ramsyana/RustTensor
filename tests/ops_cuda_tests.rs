@@ -89,6 +89,46 @@ fn assert_tensors_close(cpu_tensor: &CpuTensor, cuda_tensor: &CudaTensor, tolera
     }
 }
 
+/// Special comparison function for argmax/argmin tensors.
+/// CUDA argmax/argmin store indices as int32_t values, but they're read as f32.
+/// This function reinterprets the bit patterns correctly.
+fn assert_index_tensors_close(cpu_tensor: &CpuTensor, cuda_tensor: &CudaTensor) {
+    // 1. Check shapes first
+    let cpu_shape = cpu_tensor.shape();
+    let cuda_shape = cuda_tensor.shape();
+    assert_eq!(cpu_shape, cuda_shape, "Tensor shapes do not match");
+
+    // 2. Get data from both tensors as host Vec<f32>
+    let cpu_data = CpuBackend::copy_to_host(&*cpu_tensor.data())
+        .expect("Failed to get CPU data for comparison");
+    let cuda_data_host = CudaBackend::copy_to_host(&*cuda_tensor.data())
+        .expect("Failed to copy CUDA data to host for comparison");
+
+    // 3. Compare lengths (redundant due to shape check, but good practice)
+    assert_eq!(
+        cpu_data.len(),
+        cuda_data_host.len(),
+        "Data lengths do not match"
+    );
+
+    // 4. Compare elements, reinterpreting CUDA values as int32_t
+    for (i, (cpu_val, cuda_val)) in cpu_data.iter().zip(cuda_data_host.iter()).enumerate() {
+        // Convert CPU float to int (as it stores the index directly)
+        let cpu_index = *cpu_val as i32;
+        
+        // Reinterpret CUDA float bit pattern as int32
+        let cuda_bits = cuda_val.to_bits();
+        let cuda_index = unsafe { std::mem::transmute::<u32, i32>(cuda_bits) };
+        
+        if cpu_index != cuda_index {
+            panic!(
+                "Indices differ at position {}: CPU {} vs CUDA {} (reinterpreted as {})",
+                i, cpu_index, cuda_val, cuda_index
+            );
+        }
+    }
+}
+
 // Tolerance for floating point comparisons
 const TOLERANCE: f32 = 1e-6;
 
@@ -2084,8 +2124,8 @@ fn test_cuda_argmax() -> Result<(), Error> {
         "Case 1 Actual (CUDA): {:?}",
         CudaBackend::copy_to_host(&*actual_cuda1.data())?
     );
-    // Indices should be exactly equal as floats
-    assert_tensors_close(&expected_cpu1, &actual_cuda1, 0.0);
+    // Indices should be reinterpreted from int32_t to compare correctly
+    assert_index_tensors_close(&expected_cpu1, &actual_cuda1);
 
     // Case 2: 2D along axis 0
     let cpu_in2 = cpu_tensor(vec![1.0, 5.0, 2.0, 4.0, 0.0, 6.0], &[2, 3]);
@@ -2101,7 +2141,7 @@ fn test_cuda_argmax() -> Result<(), Error> {
         "Case 2 Actual (CUDA): {:?}",
         CudaBackend::copy_to_host(&*actual_cuda2.data())?
     );
-    assert_tensors_close(&expected_cpu2, &actual_cuda2, 0.0);
+    assert_index_tensors_close(&expected_cpu2, &actual_cuda2);
 
     // Case 3: 2D along axis 1
     let cpu_in3 = cpu_tensor(vec![1.0, 5.0, 2.0, 4.0, 0.0, 6.0], &[2, 3]);
@@ -2117,7 +2157,7 @@ fn test_cuda_argmax() -> Result<(), Error> {
         "Case 3 Actual (CUDA): {:?}",
         CudaBackend::copy_to_host(&*actual_cuda3.data())?
     );
-    assert_tensors_close(&expected_cpu3, &actual_cuda3, 0.0);
+    assert_index_tensors_close(&expected_cpu3, &actual_cuda3);
 
     println!("--- test_cuda_argmax PASSED ---");
     Ok(())
@@ -2145,7 +2185,7 @@ fn test_cuda_argmin() -> Result<(), Error> {
         "Case 1 Actual (CUDA): {:?}",
         CudaBackend::copy_to_host(&*actual_cuda1.data())?
     );
-    assert_tensors_close(&expected_cpu1, &actual_cuda1, 0.0);
+    assert_index_tensors_close(&expected_cpu1, &actual_cuda1);
 
     // Case 2: 2D along axis 0
     let cpu_in2 = cpu_tensor(vec![1.0, 5.0, 2.0, 0.5, 1.0, 6.0], &[2, 3]);
@@ -2161,7 +2201,7 @@ fn test_cuda_argmin() -> Result<(), Error> {
         "Case 2 Actual (CUDA): {:?}",
         CudaBackend::copy_to_host(&*actual_cuda2.data())?
     );
-    assert_tensors_close(&expected_cpu2, &actual_cuda2, 0.0);
+    assert_index_tensors_close(&expected_cpu2, &actual_cuda2);
 
     // Case 3: 2D along axis 1
     let cpu_in3 = cpu_tensor(vec![1.0, 5.0, 0.5, 4.0, 1.0, 6.0], &[2, 3]);
@@ -2177,7 +2217,7 @@ fn test_cuda_argmin() -> Result<(), Error> {
         "Case 3 Actual (CUDA): {:?}",
         CudaBackend::copy_to_host(&*actual_cuda3.data())?
     );
-    assert_tensors_close(&expected_cpu3, &actual_cuda3, 0.0);
+    assert_index_tensors_close(&expected_cpu3, &actual_cuda3);
 
     println!("--- test_cuda_argmin PASSED ---");
     Ok(())

@@ -1292,7 +1292,7 @@ impl Backend for CudaBackend {
         kernel_size: (usize, usize),
         stride: (usize, usize),
         padding: (usize, usize),
-    ) -> Result<(Self::Storage, Self::Storage), Error> { // (Output_values, Output_indices_as_f32)
+    ) -> Result<(Self::Storage, Self::Storage), Error> { // (Output_values, Output_indices_as_int32)
         debug_println!("[CudaBackend::max_pool2d][CUDA] ENTERING native CUDA implementation");
         let input_shape = Self::shape(input);
         if input_shape.len() != 4 {
@@ -1316,7 +1316,7 @@ impl Backend for CudaBackend {
 
         let output_shape_vec = vec![n, c, h_out, w_out];
         let mut output_values = Self::zeros(&output_shape_vec)?;
-        let mut output_indices = Self::zeros(&output_shape_vec)?; // Indices stored as f32
+        let mut output_indices = Self::zeros(&output_shape_vec)?; // Indices stored as int32
 
         if n == 0 || c == 0 || h_out == 0 || w_out == 0 {
             return Ok((output_values, output_indices)); // Return empty if output is empty
@@ -4010,7 +4010,7 @@ impl Backend for CudaBackend {
         let output_ndim = output_shape.len();
         let n_output = output_shape.iter().product::<usize>().max(1); // Output size, ensure 1 for scalar
 
-        // Allocate output storage (stores indices as floats)
+        // Allocate output storage (stores indices as int32_t)
         let mut output = CudaStorage::zeros(&output_shape)?; // Initialize with zeros
 
         // Prepare kernel arguments
@@ -4090,7 +4090,7 @@ impl Backend for CudaBackend {
         let output_ndim = output_shape.len();
         let n_output = output_shape.iter().product::<usize>().max(1);
 
-        // Allocate output storage
+        // Allocate output storage (stores indices as int32_t)
         let mut output = CudaStorage::zeros(&output_shape)?;
 
         // Prepare kernel arguments

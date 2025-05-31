@@ -71,7 +71,7 @@ extern "C" {
             }
         }
         // Otherwise, this is an axis reduction
-        else if (ndim == 2 && i < dims[0]) {
+        else if (ndim == 2) {
             // We're reducing a 2D tensor along an axis
             // For axis=0 reduction (dims = [rows, cols], output = [cols])
             // For axis=1 reduction (dims = [rows, cols], output = [rows])
@@ -79,6 +79,7 @@ extern "C" {
             const int rows = dims[1];  // Number of rows (first dimension)
             const int cols = dims[2];  // Number of columns (second dimension)
             const int axis = dims[3];  // Axis to reduce along (0 = rows, 1 = columns)
+            const int flat_size = rows * cols;  // Total number of elements
             
             // Debug the shape and axis
             if (tid == 0 && blockIdx.x == 0) {
@@ -186,7 +187,7 @@ extern "C" {
             }
         }
         // Otherwise, this is an axis reduction
-        else if (ndim == 2 && i < dims[0]) {
+        else if (ndim == 2) {
             // We're reducing a 2D tensor along an axis
             // For axis=0 reduction (dims = [rows, cols], output = [cols])
             // For axis=1 reduction (dims = [rows, cols], output = [rows])
@@ -194,6 +195,7 @@ extern "C" {
             const int rows = dims[1];  // Number of rows (first dimension)
             const int cols = dims[2];  // Number of columns (second dimension)
             const int axis = dims[3];  // Axis to reduce along (0 = rows, 1 = columns)
+            const int flat_size = rows * cols;  // Total number of elements
             
             // Debug the shape and axis
             if (tid == 0 && blockIdx.x == 0) {
@@ -301,7 +303,7 @@ extern "C" {
             }
         }
         // Otherwise, this is an axis reduction
-        else if (ndim == 2 && i < dims[0]) {
+        else if (ndim == 2) {
             // We're reducing a 2D tensor along an axis
             // For axis=0 reduction (dims = [rows, cols], output = [cols])
             // For axis=1 reduction (dims = [rows, cols], output = [rows])
@@ -309,6 +311,7 @@ extern "C" {
             const int rows = dims[1];  // Number of rows (first dimension)
             const int cols = dims[2];  // Number of columns (second dimension)
             const int axis = dims[3];  // Axis to reduce along (0 = rows, 1 = columns)
+            const int flat_size = rows * cols;  // Total number of elements
             
             // Debug the shape and axis
             if (tid == 0 && blockIdx.x == 0) {
@@ -467,10 +470,10 @@ extern "C" {
 
     /*
      * Computes the index of the maximum value along a specified axis.
-     * Output stores indices as float values.
+     * Output stores indices as int32_t values.
      */
     extern "C" __global__ void argmax_along_axis_kernel(
-        const float* input, float* output_indices,
+        const float* input, int32_t* output_indices,
         const int* input_shape, const int* input_strides,
         const int* output_shape, const int* output_strides,
         int input_ndim, int output_ndim, int axis, int n_output,
@@ -536,16 +539,16 @@ extern "C" {
             }
         }
 
-        // Write the index (as a float) to the output tensor
-        output_indices[output_idx] = (float)max_idx;
+        // Write the index to the output tensor
+        output_indices[output_idx] = max_idx;
     }
 
     /*
      * Computes the index of the minimum value along a specified axis.
-     * Output stores indices as float values.
+     * Output stores indices as int32_t values.
      */
     extern "C" __global__ void argmin_along_axis_kernel(
-        const float* input, float* output_indices,
+        const float* input, int32_t* output_indices,
         const int* input_shape, const int* input_strides,
         const int* output_shape, const int* output_strides,
         int input_ndim, int output_ndim, int axis, int n_output,
@@ -607,7 +610,7 @@ extern "C" {
             }
         }
 
-        // Write the index (as a float) to the output tensor
-        output_indices[output_idx] = (float)min_idx;
+        // Write the index to the output tensor
+        output_indices[output_idx] = min_idx;
     }
 }
